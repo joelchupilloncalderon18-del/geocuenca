@@ -155,77 +155,70 @@ elif opcion_menu == "2. Punto de Aforo":
 elif opcion_menu == "3. Modelamiento Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
-            with st.spinner("Ejecutando WhiteboxTools en entorno web/local..."):
+            with st.spinner("Procesando modelo espacial y cuenca vertiente..."):
                 try:
                     import whitebox
                     import geopandas as gpd
                     import rasterio
+                    import time
                     from rasterio.features import shapes
                     from shapely.geometry import shape
+                    import pandas as pd
 
-                    # Inicializar WhiteboxTools configurando explícitamente el directorio temporal con permisos
                     wbt = whitebox.WhiteboxTools()
                     base_dir = "/tmp" if os.path.exists("/tmp") else os.getcwd()
                     wbt.set_working_dir(base_dir)
                     wbt.set_verbose_mode(False)
 
                     dem_input = st.session_state.dem_path
-                    dem_basename = os.path.basename(dem_input)
-                    dem_work = os.path.join(base_dir, dem_basename)
+                    dem_work = os.path.join(base_dir, "work_dem_input.tif")
 
-                    # Copiar el DEM al directorio de trabajo seguro
                     import shutil
-                    if dem_input != dem_work:
+                    if os.path.abspath(dem_input) != os.path.abspath(dem_work):
                         shutil.copy(dem_input, dem_work)
 
-                    # Rutas de salida relativas al working_dir
                     f_depressions = os.path.join(base_dir, "dem_breached.tif")
                     f_flow_acc = os.path.join(base_dir, "flow_acc.tif")
-                    f_streams = os.path.join(base_dir, "streams.tif")
+                    f_d8 = os.path.join(base_dir, "d8_pointer.tif")
                     f_watershed = os.path.join(base_dir, "watershed.tif")
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
 
-                    # 1. Breacher depresiones / Rellenar huecos
+                    # Procesamiento con WhiteboxTools
                     wbt.breach_depressions(dem_work, f_depressions)
-
-                    # 2. Dirección de flujo (D8)
-                    f_d8 = os.path.join(base_dir, "d8_pointer.tif")
                     wbt.d8_pointer(f_depressions, f_d8)
-
-                    # 3. Acumulación de flujo
                     wbt.d8_flow_accumulation(f_depressions, f_flow_acc, out_type="cells")
 
-                    # 4. Snap pour point (Ajuste del punto de aforo a la celda de mayor acumulación)
-                    # Creamos un archivo de puntos temporal con las coordenadas del aforo
-                    import pandas as pd
                     points_csv = os.path.join(base_dir, "outlet.csv")
                     with open(points_csv, "w") as f:
                         f.write(f"X,Y\n{st.session_state.x_outlet},{st.session_state.y_outlet}\n")
 
                     f_snap = os.path.join(base_dir, "outlet_snap.shp")
                     wbt.snap_pour_points(points_csv, f_flow_acc, f_snap, snap_dist=50.0)
-
-                    # 5. Delimitar cuenca hidrográfica (Watershed)
                     wbt.watershed(f_d8, f_snap, f_watershed)
 
-                    # 6. Raster a Vector (Polygonize)
+                    # PEQUEÑA PAUSA DE SEGURIDAD (Evita que Linux en la nube lea antes de que el archivo termine de escribirse)
+                    time.sleep(1.0)
+
+                    if not os.path.exists(f_watershed):
+                        st.error("Error crítico: WhiteboxTools no generó el archivo watershed.tif en el servidor.")
+                        st.stop()
+
+                    # Vectorización segura
                     with rasterio.open(f_watershed) as src:
                         watershed_data = src.read(1)
                         transform = src.transform
                         bounds = src.bounds
-                        crs = src.crs
-                        # Máscara binaria donde la cuenca > 0
                         mask = (watershed_data > 0).astype(np.uint8)
                         
                         if not np.any(mask):
-                            st.error("WhiteboxTools no generó una cuenca válida para el punto de aforo seleccionado.")
+                            st.error("La cuenca generada está vacía. Verifique la ubicación del punto de aforo.")
                             st.stop()
 
                         shape_generator = shapes(mask, transform=transform)
                         records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("No se pudo vectorizar la cuenca generada.")
+                        st.error("No se pudo vectorizar la cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=st.session_state.selected_epsg)
@@ -235,15 +228,16 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # 7. Cálculo métrico exacto proyectado en UTM
-                    if gdf.crs and gdf.crs.is_geographic:
-                        centroid_lat = gdf.geometry.centroid.y.iloc[0]
-                        utm_zone = int((st.session_state.x_outlet + 180) / 6) + 1
-                        hemisphere_code = '7' if centroid_lat < 0 else '6'
-                        epsg_utm = f"32{hemisphere_code}{utm_zone:02d}"
-                        gdf_m = gdf.to_crs(f"EPSG:{epsg_utm}")
-                    else:
-                        gdf_m = gdf
+                    # CONVERSIÓN OBLIGATORIA A UTM PARA MÉTRICAS REALES (Evita los 0.00 km2)
+                    centroid_lat = gdf.geometry.centroid.y.iloc[0]
+                    centroid_lon = gdf.geometry.centroid.x.iloc[0]
+                    
+                    utm_zone = int((centroid_lon + 180) / 6) + 1
+                    hemisphere_code = '7' if centroid_lat < 0 else '6'
+                    epsg_utm = f"32{hemisphere_code}{utm_zone:02d}"
+                    
+                    # Proyectar el GeoDataFrame a metros (UTM) para que el cálculo de área y perímetro sea exacto
+                    gdf_m = gdf.to_crs(f"EPSG:{epsg_utm}")
 
                     area_m2 = gdf_m.geometry.area.sum()
                     perimetro_m = gdf_m.geometry.length.sum()
@@ -251,29 +245,27 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     area_km2 = area_m2 / 1_000_000
                     perimetro_km = perimetro_m / 1_000
 
+                    # Índice de Compacidad de Gravelius (Kc)
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
                     st.success("¡Delimitación hidrológica exacta completada con éxito!")
 
-                    # Métricas en pantalla
+                    # Métricas corregidas en pantalla
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
                     m2.metric("Perímetro", f"{perimetro_km:.2f} km")
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
-                    # Visualización del DEM recortado con la cuenca real
+                    # Visualización del DEM recortado
                     with rasterio.open(dem_work) as src:
                         dem_data = src.read(1).astype(np.float32)
                         nodata = src.nodata
                         if nodata is not None:
                             dem_data[dem_data == nodata] = np.nan
 
-                    with rasterio.open(f_watershed) as src:
-                        w_mask = src.read(1) > 0
-
                     dem_clipped = dem_data.copy()
-                    dem_clipped[~w_mask] = np.nan
+                    dem_clipped[~mask.astype(bool)] = np.nan
 
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
