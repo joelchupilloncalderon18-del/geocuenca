@@ -39,6 +39,7 @@ st.markdown("""
 
 # Inicializar WhiteboxTools
 wbt = whitebox.WhiteboxTools()
+wbt.set_work_dir("/tmp")
 wbt.set_verbose_mode(False)
 
 if 'dem_loaded' not in st.session_state:
