@@ -37,12 +37,10 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Inicializar WhiteboxTools apuntando directamente al directorio temporal
+# Inicializar WhiteboxTools sin descarga automática en ruta protegida
 import whitebox
 wbt = whitebox.WhiteboxTools()
 wbt.work_dir = "/tmp"
-wbt.set_lieb_path() if hasattr(wbt, 'set_lieb_path') else None
-wbt.set_verbose_mode(False)
 
 if 'dem_loaded' not in st.session_state:
     st.session_state.dem_loaded = False
