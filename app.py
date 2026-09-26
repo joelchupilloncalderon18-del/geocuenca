@@ -155,7 +155,8 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
             with st.spinner("Procesando modelo espacial y cierre en punto de aforo..."):
                 try:
-                    base_dir = os.getcwd()
+                    # Directorio seguro compatible con local (Windows) y nube (Linux /tmp)
+                    base_dir = "/tmp" if os.path.exists("/tmp") else os.getcwd()
                     wbt.set_working_dir(base_dir)
                     wbt.set_verbose_mode(False)
 
@@ -173,11 +174,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     pour_points_abs = os.path.join(base_dir, pour_points_shp)
                     output_geojson_abs = os.path.join(base_dir, output_geojson)
 
-                    dem_input_name = os.path.basename(st.session_state.dem_path)
+                    # Copiar el DEM cargado al directorio de trabajo seguro si es necesario
+                    dem_input_path = st.session_state.dem_path
 
-                    wbt.fill_depressions(dem_input_name, dem_filled)
-                    wbt.d8_pointer(dem_filled, d8_pointer)
-                    wbt.d8_flow_accumulation(dem_filled, flow_accum)
+                    # Procesamiento con WhiteboxTools (Motor Hidrológico Real)
+                    wbt.fill_depressions(dem_input_path, dem_filled_abs)
+                    wbt.d8_pointer(dem_filled_abs, d8_pointer_abs)
+                    wbt.d8_flow_accumulation(dem_filled_abs, flow_accum_abs)
 
                     if not os.path.exists(flow_accum_abs):
                         st.error("WhiteboxTools no genero el archivo de acumulacion de flujo.")
@@ -216,7 +219,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     )
                     pour_gdf.to_file(pour_points_abs)
 
-                    wbt.watershed(d8_pointer, pour_points_shp, watershed_raster)
+                    wbt.watershed(d8_pointer_abs, pour_points_abs, watershed_raster_abs)
 
                     if not os.path.exists(watershed_raster_abs):
                         st.error("No se pudo generar el raster de cuenca.")
@@ -225,7 +228,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     with rasterio.open(watershed_raster_abs) as src:
                         basin_mask = src.read(1) > 0
 
-                    with rasterio.open(st.session_state.dem_path) as src_dem:
+                    with rasterio.open(dem_input_path) as src_dem:
                         dem_raw = src_dem.read(1)
                         nodata = src_dem.nodata
 
@@ -245,9 +248,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     
                     gdf.to_file(output_geojson_abs, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
-                    st.session_state.basin_mask = basin_mask
-                    st.session_state.transform = transform
-                    st.session_state.gdf = gdf
 
                     area_m2 = gdf.geometry.area.sum()
                     perimetro_m = gdf.geometry.length.sum()
@@ -261,11 +261,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 0
 
-                    st.success("Delimitacion completada con exito.")
+                    st.success("¡Delimitación hidrológica exacta completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Area de Cuenca", f"{area_km2:.2f} km2")
-                    m2.metric("Perimetro", f"{perimetro_km:.2f} km")
+                    m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
+                    m2.metric("Perímetro", f"{perimetro_km:.2f} km")
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
@@ -281,11 +281,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     ax.scatter([snapped_x], [snapped_y], color='#eab308', marker='o', s=90, label='Punto de Cierre (Snap)')
                     ax.set_title("Cuenca Delimitada (GeoCuenca v1.0)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
-                    fig.colorbar(im, label="Elevacion (msnm)")
+                    fig.colorbar(im, label="Elevación (msnm)")
                     st.pyplot(fig)
 
                 except Exception as e:
-                    st.error(f"Error durante el procesamiento hidrologico: {e}")
+                    st.error(f"Error durante el procesamiento hidrológico: {e}")
     else:
         st.warning("Configure el DEM y el punto de aforo primero.")
 
