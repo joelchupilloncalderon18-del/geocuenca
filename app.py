@@ -37,11 +37,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Inicializar WhiteboxTools apuntando al directorio temporal seguro
+# Inicialización y configuración segura de WhiteboxTools para Streamlit Cloud
 os.environ["WBT_PATH"] = "/tmp/WBT"
 wbt = whitebox.WhiteboxTools()
 wbt.work_dir = "/tmp"
 wbt.set_working_dir("/tmp")
+wbt.set_verbose_mode(False)
 
 if 'dem_loaded' not in st.session_state:
     st.session_state.dem_loaded = False
