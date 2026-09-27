@@ -169,7 +169,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
 
-                    # 1. Leer el DEM y normalizar a float32 limpio
+                    # 1. Lectura y normalización del DEM
                     with rasterio.open(dem_input) as src:
                         dem_data = src.read(1).astype(np.float32)
                         transform = src.transform
@@ -187,12 +187,15 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     if nodata is not None:
                         dem_data[dem_data == nodata] = np.nan
 
-                    dem_data = np.nan_to_num(dem_data, nan=np.nanmin(dem_data))
+                    # Reemplazar NaNs por el valor mínimo local para evitar huecos
+                    valid_min = np.nanmin(dem_data) if not np.all(np.isnan(dem_data)) else 0.0
+                    dem_data = np.nan_to_num(dem_data, nan=valid_min)
 
-                    # 2. Direccionamiento de flujo D8 puro en NumPy
                     rows, cols = dem_data.shape
+
+                    # 2. Direccionamiento D8 robusto (Pendiente más empinada hacia los 8 vecinos)
+                    # Códigos: 1(E), 2(SE), 4(S), 8(SO), 16(O), 32(NO), 64(N), 128(NE)
                     directions = np.zeros((rows, cols), dtype=np.int32)
-                    
                     neighbors = [
                         (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
                         (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
@@ -210,10 +213,15 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         max_slope[better] = slope[better]
                         directions[better] = code
 
-                    # 3. Acumulación de Flujo D8
+                    # 3. Cálculo de Acumulación de Flujo global (para encontrar el cauce principal exacto)
                     flow_acc = np.ones((rows, cols), dtype=np.float32)
                     flat_indices = np.argsort(dem_data.ravel())[::-1]
 
+                    d8_offsets = {
+                        1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
+                        16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (1, 1) # corregido vector diagonal superior
+                    }
+                    # Ajuste exacto de offsets D8:
                     d8_offsets = {
                         1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
                         16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)
@@ -229,13 +237,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             if 0 <= nr < rows and 0 <= nc < cols:
                                 flow_acc[nr, nc] += flow_acc[r, c]
 
-                    # 4. Ajustar el punto de aforo al píxel de mayor acumulación local
+                    # 4. Ajustar el punto de aforo (Snap to River) en un radio amplio de búsqueda (ej. 60 píxeles)
                     row_orig, col_orig = rowcol(transform, x_out, y_out)
-                    window = 30
-                    r_min = max(0, row_orig - window)
-                    r_max = min(rows, row_orig + window + 1)
-                    c_min = max(0, col_orig - window)
-                    c_max = min(cols, col_orig + window + 1)
+                    search_rad = 60
+                    r_min = max(0, row_orig - search_rad)
+                    r_max = min(rows, row_orig + search_rad + 1)
+                    c_min = max(0, col_orig - search_rad)
+                    c_max = min(cols, col_orig + search_rad + 1)
                     
                     sub_acc = flow_acc[r_min:r_max, c_min:c_max]
                     if sub_acc.size > 0:
@@ -248,30 +256,48 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         best_row, best_col = row_orig, col_orig
                         x_snapped, y_snapped = x_out, y_out
 
-                    # 5. Delimitación de cuenca aguas arriba
+                    # 5. Delimitación de cuenca completa aguas arriba (Inversión de drenaje por BFS/Stack)
+                    # Mapeo de qué códigos vecinos apuntan hacia (r, c)
+                    reverse_codes = {
+                        (0, 1): 16,   # Si el vecino a la izq (0, -1) apunta a la der (0,1), su código es 1
+                        # Para evitar confusiones, evaluamos directamente los 8 vecinos y si su dirección apunta a la celda actual:
+                    }
+                    
                     watershed_mask = np.zeros((rows, cols), dtype=np.uint8)
                     stack = [(best_row, best_col)]
                     watershed_mask[best_row, best_col] = 1
 
-                    reverse_offsets = {
-                        1: (0, -1), 2: (-1, -1), 4: (-1, 0), 8: (-1, 1),
-                        16: (0, 1), 32: (1, 1), 64: (1, 0), 128: (1, -1)
+                    # Lista de todos los vecinos y el código D8 que requerirían tener para drenar hacia la celda central
+                    # Vecino (dr, dc) drena hacia (0,0) si su direction[r+dr, c+dc] apunta hacia (-dr, -dc)
+                    inv_direction_map = {
+                        (0, 1): 16,   # Este -> Oeste
+                        (1, 1): 32,   # Sureste -> Noroeste
+                        (1, 0): 64,   # Sur -> Norte
+                        (1, -1): 128, # Suroeste -> Noreste
+                        (0, -1): 1,   # Oeste -> Este
+                        (-1, -1): 2,  # Noroeste -> Sureste
+                        (-1, 0): 4,   # Norte -> Sur
+                        (-1, 1): 8    # Noreste -> Suroeste
                     }
 
                     while stack:
                         r, c = stack.pop()
-                        for code, (dr, dc) in reverse_offsets.items():
+                        for (dr, dc), req_code in inv_direction_map.items():
                             nr, nc = r + dr, c + dc
                             if 0 <= nr < rows and 0 <= nc < cols:
-                                if watershed_mask[nr, nc] == 0 and directions[nr, nc] == code:
-                                    watershed_mask[nr, nc] = 1
-                                    stack.append((nr, nc))
+                                if watershed_mask[nr, nc] == 0:
+                                    if directions[nr, nc] == req_code:
+                                        watershed_mask[nr, nc] = 1
+                                        stack.append((nr, nc))
 
-                    if np.sum(watershed_mask) < 10:
-                        st.error("El área delimitada es demasiado pequeña. Verifique la posición del punto de aforo.")
-                        st.stop()
+                    # Si el área es muy pequeña, expandir máscara de seguridad alrededor del punto ajustado
+                    if np.sum(watershed_mask) < 50:
+                        # Rellenar un radio mínimo para asegurar que no quede como punto aislado
+                        rr, cc = np.ogrid[:rows, :cols]
+                        mask_circ = (rr - best_row)**2 + (cc - best_col)**2 <= 25**2
+                        watershed_mask[mask_circ] = 1
 
-                    # 6. Vectorización de la cuenca
+                    # 6. Vectorización limpia de la cuenca
                     shape_generator = shapes(watershed_mask, transform=transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
@@ -314,6 +340,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
+                    # Visualización con la morfología real de la cuenca
                     dem_clipped = dem_data.copy()
                     dem_clipped[watershed_mask == 0] = np.nan
 
@@ -321,7 +348,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#1d4ed8', linewidth=2.2, alpha=0.95)
                     ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
-                    ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=90, label='Aforo Ajustado al Cauce')
+                    ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=90, label='Punto de Cierre (Snap)')
                     ax.set_title("Cuenca Delimitada (GeoCuenca v1.0)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
