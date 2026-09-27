@@ -173,45 +173,69 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     if os.path.abspath(dem_input) != os.path.abspath(dem_work):
                         shutil.copy(dem_input, dem_work)
 
+                    # Validación previa de límites del DEM con el punto de aforo
+                    with rasterio.open(dem_work) as src:
+                        bounds = src.bounds
+                        raster_crs = src.crs
+                        transform = src.transform
+                        
+                        x_out = float(st.session_state.x_outlet)
+                        y_out = float(st.session_state.y_outlet)
+                        
+                        if not (bounds.left <= x_out <= bounds.right and bounds.bottom <= y_out <= bounds.top):
+                            st.error(f"Error: Las coordenadas del aforo (X: {x_out:.2f}, Y: {y_out:.2f}) están fuera de los límites del DEM "
+                                     f"([{bounds.left:.2f}, {bounds.right:.2f}] / [{bounds.bottom:.2f}, {bounds.top:.2f}]). "
+                                     f"Verifique la Fase 2 (Punto de Aforo) y el sistema de coordenadas CRS.")
+                            st.stop()
+
                     f_watershed = os.path.join(base_dir, "watershed.tif")
                     
-                    # Eliminar resultados anteriores si existieran para forzar cálculo limpio
-                    for f_temp in [f_watershed, os.path.join(base_dir, "dem_breached.tif"), os.path.join(base_dir, "flow_acc.tif"), os.path.join(base_dir, "d8_pointer.tif")]:
+                    # Limpiar archivos temporales previos
+                    for f_temp in [f_watershed, os.path.join(base_dir, "dem_breached.tif"), os.path.join(base_dir, "flow_acc.tif"), os.path.join(base_dir, "d8_pointer.tif"), os.path.join(base_dir, "outlet_snap.shp")]:
                         if os.path.exists(f_temp):
-                            os.remove(f_temp)
+                            try:
+                                os.remove(f_temp)
+                            except:
+                                pass
 
-                    # Ejecución de WhiteboxTools paso a paso
                     wbt = whitebox.WhiteboxTools()
                     wbt.set_working_dir(base_dir)
-                    wbt.set_verbose_mode(False)
+                    # Activamos temporalmente el modo verboso en consola para depurar si hubiera fallo interno
+                    wbt.set_verbose_mode(True)
 
                     f_depressions = os.path.join(base_dir, "dem_breached.tif")
                     f_flow_acc = os.path.join(base_dir, "flow_acc.tif")
                     f_d8 = os.path.join(base_dir, "d8_pointer.tif")
 
+                    # Procesamiento hidrológico básico asegurado
                     wbt.breach_depressions(dem_work, f_depressions)
                     wbt.d8_pointer(f_depressions, f_d8)
                     wbt.d8_flow_accumulation(f_depressions, f_flow_acc, out_type="cells")
 
                     points_csv = os.path.join(base_dir, "outlet.csv")
                     with open(points_csv, "w") as f:
-                        f.write(f"X,Y\n{st.session_state.x_outlet},{st.session_state.y_outlet}\n")
+                        f.write(f"X,Y\n{x_out},{y_out}\n")
 
                     f_snap = os.path.join(base_dir, "outlet_snap.shp")
-                    wbt.snap_pour_points(points_csv, f_flow_acc, f_snap, snap_dist=100.0)
+                    # Incrementamos el radio de búsqueda (snap_dist) a 200m para asegurar que capture el cauce principal
+                    wbt.snap_pour_points(points_csv, f_flow_acc, f_snap, snap_dist=200.0)
+                    
+                    # Generación de cuenca
                     wbt.watershed(f_d8, f_snap, f_watershed)
                     
-                    # Esperar y verificar que el archivo de Whitebox se haya escrito físicamente
-                    for _ in range(10):
+                    # Bucle de espera activa
+                    for _ in range(15):
                         if os.path.exists(f_watershed) and os.path.getsize(f_watershed) > 0:
                             break
-                        time.sleep(0.5)
+                        time.sleep(0.6)
 
                     if not os.path.exists(f_watershed) or os.path.getsize(f_watershed) == 0:
-                        st.error("Error crítico: WhiteboxTools no generó el ráster de cuenca. Verifique las coordenadas del punto de aforo (deben estar dentro de los límites del DEM).")
+                        st.error("WhiteboxTools no generó el ráster 'watershed.tif'. Esto ocurre habitualmente porque el punto de aforo "
+                                 "no cayó exactamente sobre una celda con suficiente acumulación de flujo (río principal). "
+                                 "Intente reubicar el punto de aforo ligeramente más hacia el centro del cauce en la Fase 2.")
                         st.stop()
 
-                    # Vectorización directa del ráster real generado por Whitebox
+                    # Vectorización y cálculo de parámetros
                     with rasterio.open(f_watershed) as src:
                         watershed_data = src.read(1)
                         transform = src.transform
@@ -223,7 +247,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("No se pudo vectorizar la cuenca a partir del modelo hidrológico.")
+                        st.error("El ráster generado está vacío o no contiene celdas válidas de cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else st.session_state.selected_epsg)
@@ -233,7 +257,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # Proyección automática a UTM para cálculo exacto en km2 y km
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -255,7 +278,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     st.success("¡Delimitación hidrológica exacta completada con éxito!")
 
-                    # Métricas finales en pantalla
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
                     m2.metric("Perímetro", f"{perimetro_km:.2f} km")
@@ -274,8 +296,8 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#1d4ed8', linewidth=2.2, alpha=0.95)
-                    ax.scatter([st.session_state.x_outlet], [st.session_state.y_outlet], color='red', marker='X', s=110, label='Aforo Original')
-                    ax.scatter([st.session_state.x_outlet], [st.session_state.y_outlet], color='#eab308', marker='o', s=90, label='Punto de Cierre (Snap)')
+                    ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
+                    ax.scatter([x_out], [y_out], color='#eab308', marker='o', s=90, label='Punto de Cierre (Snap)')
                     ax.set_title("Cuenca Delimitada (GeoCuenca v1.0)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
