@@ -164,7 +164,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     from rasterio.features import shapes
                     from shapely.geometry import shape
                     from rasterio.transform import rowcol, xy
-                    from scipy.ndimage import label
 
                     base_dir = os.path.abspath(os.getcwd())
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
@@ -188,43 +187,33 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     if nodata is not None:
                         dem_data[dem_data == nodata] = np.nan
 
-                    # Rellenar valores nulos o bordes para evitar huecos en el cálculo
                     dem_data = np.nan_to_num(dem_data, nan=np.nanmin(dem_data))
 
-                    # 2. Direccionamiento de flujo D8 simplificado y robusto en Matriz NumPy
-                    # Direcciones D8: 1(E), 2(SE), 4(S), 8(SO), 16(O), 32(NO), 64(N), 128(NE)
+                    # 2. Direccionamiento de flujo D8 puro en NumPy
                     rows, cols = dem_data.shape
                     directions = np.zeros((rows, cols), dtype=np.int32)
                     
-                    # Vecinos offsets (dr, dc, code)
                     neighbors = [
                         (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
                         (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
                     ]
 
-                    # Calcular pendientes máximas hacia los 8 vecinos
                     padded_dem = np.pad(dem_data, 1, mode='edge')
                     max_slope = np.zeros((rows, cols), dtype=np.float32)
                     
                     for dr, dc, code in neighbors:
-                        # Ventana desplazada
                         neighbor_elev = padded_dem[1+dr:1+dr+rows, 1+dc:1+dc+cols]
-                        # Distancia (diagonal es sqrt(2), ortogonal es 1)
                         dist = np.sqrt(dr**2 + dc**2)
                         slope = (dem_data - neighbor_elev) / dist
                         
-                        # Actualizar dirección si la pendiente es mayor
                         better = slope > max_slope
                         max_slope[better] = slope[better]
                         directions[better] = code
 
-                    # 3. Acumulación de Flujo D8 basada en orden topológico (Cell Routing)
+                    # 3. Acumulación de Flujo D8
                     flow_acc = np.ones((rows, cols), dtype=np.float32)
-                    
-                    # Ordenar celdas de mayor a menor elevación para acumular correctamente desde las partes altas
                     flat_indices = np.argsort(dem_data.ravel())[::-1]
 
-                    # Mapeo de códigos D8 a offsets (dr, dc)
                     d8_offsets = {
                         1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
                         16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)
@@ -240,7 +229,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             if 0 <= nr < rows and 0 <= nc < cols:
                                 flow_acc[nr, nc] += flow_acc[r, c]
 
-                    # 4. Ajustar el punto de aforo al píxel de mayor acumulación local (cauce principal)
+                    # 4. Ajustar el punto de aforo al píxel de mayor acumulación local
                     row_orig, col_orig = rowcol(transform, x_out, y_out)
                     window = 30
                     r_min = max(0, row_orig - window)
@@ -259,12 +248,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         best_row, best_col = row_orig, col_orig
                         x_snapped, y_snapped = x_out, y_out
 
-                    # 5. Delimitación de cuenca aguas arriba (Tracing upstream desde el punto ajustado)
+                    # 5. Delimitación de cuenca aguas arriba
                     watershed_mask = np.zeros((rows, cols), dtype=np.uint8)
                     stack = [(best_row, best_col)]
                     watershed_mask[best_row, best_col] = 1
 
-                    # Inverso de los offsets D8 para saber qué celdas fluyen hacia (r, c)
                     reverse_offsets = {
                         1: (0, -1), 2: (-1, -1), 4: (-1, 0), 8: (-1, 1),
                         16: (0, 1), 32: (1, 1), 64: (1, 0), 128: (1, -1)
@@ -280,10 +268,10 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                                     stack.append((nr, nc))
 
                     if np.sum(watershed_mask) < 10:
-                        st.error("El área delimitada es demasiado pequeña. Verifique la posición del punto de aforo sobre el relieve.")
+                        st.error("El área delimitada es demasiado pequeña. Verifique la posición del punto de aforo.")
                         st.stop()
 
-                    # 6. Vectorización de la cuenca resultante
+                    # 6. Vectorización de la cuenca
                     shape_generator = shapes(watershed_mask, transform=transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
@@ -318,7 +306,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación hidrológica exacta completada con éxito (motor nativo optimizado)!")
+                    st.success("¡Delimitación hidrológica exacta completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
@@ -326,7 +314,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
-                    # Visualización del resultado
                     dem_clipped = dem_data.copy()
                     dem_clipped[watershed_mask == 0] = np.nan
 
