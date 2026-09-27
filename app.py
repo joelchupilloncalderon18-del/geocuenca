@@ -164,12 +164,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     from rasterio.features import shapes
                     from shapely.geometry import shape
                     from rasterio.transform import rowcol, xy
+                    import pyproj
 
                     base_dir = os.path.abspath(os.getcwd())
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
 
-                    # 1. Leer el DEM y sus metadatos espaciales exactos
+                    # 1. Leer el DEM y extraer su sistema de referencia exacto (CRS)
                     with rasterio.open(dem_input) as src:
                         dem_data = src.read(1).astype(np.float32)
                         transform = src.transform
@@ -180,20 +181,19 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         x_out = float(st.session_state.x_outlet)
                         y_out = float(st.session_state.y_outlet)
 
-                    # Validación y ajuste inteligente de unidades si hay discrepancia lat/lon vs UTM
-                    if raster_crs and not raster_crs.is_geographic:
+                    # 2. Sincronización estricta de sistemas de coordenadas (CRS / Proyección)
+                    # Si el DEM tiene un CRS definido y las coordenadas ingresadas son lon/lat (-180 a 180)
+                    if raster_crs:
+                        transformer_to_raster = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
+                        # Comprobamos si el punto ingresado parece estar en grados (ej. -79.22, -6.63)
                         if abs(x_out) <= 180 and abs(y_out) <= 90:
-                            import pyproj
-                            utm_zone = int((x_out + 180) / 6) + 1
-                            hemisphere_code = '7' if y_out < 0 else '6'
-                            epsg_target = f"32{hemisphere_code}{utm_zone:02d}"
-                            
-                            transformer = pyproj.Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_target}", always_xy=True)
-                            x_out, y_out = transformer.transform(x_out, y_out)
+                            x_out, y_out = transformer_to_raster.transform(x_out, y_out)
 
+                    # Validación final dentro de los límites del DEM
                     if not (bounds.left <= x_out <= bounds.right and bounds.bottom <= y_out <= bounds.top):
-                        st.error(f"Error espacial: Las coordenadas del aforo ({x_out}, {y_out}) están fuera de los límites del DEM "
-                                 f"[{bounds.left:.1f}, {bounds.right:.1f}, {bounds.bottom:.1f}, {bounds.top:.1f}].")
+                        st.error(f"Error espacial crítico: Las coordenadas transformadas del aforo ({x_out:.2f}, {y_out:.2f}) "
+                                 f"caen fuera de los límites del DEM [{bounds.left:.1f}, {bounds.right:.1f}, {bounds.bottom:.1f}, {bounds.top:.1f}]. "
+                                 f"Verifique que el DEM cargado corresponda al área de estudio.")
                         st.stop()
 
                     if nodata is not None:
@@ -203,7 +203,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     dem_data = np.nan_to_num(dem_data, nan=valid_min)
                     rows, cols = dem_data.shape
 
-                    # 2. Dirección de flujo D8 (pendiente máxima hacia los 8 vecinos)
+                    # 3. Dirección de flujo D8 (pendiente máxima hacia los 8 vecinos)
                     directions = np.zeros((rows, cols), dtype=np.int32)
                     neighbors = [
                         (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
@@ -221,7 +221,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         max_slope[better] = slope[better]
                         directions[better] = code
 
-                    # 3. Acumulación de Flujo Global
+                    # 4. Acumulación de Flujo Global
                     flow_acc = np.ones((rows, cols), dtype=np.float32)
                     flat_indices = np.argsort(dem_data.ravel())[::-1]
                     d8_offsets = {
@@ -239,9 +239,9 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             if 0 <= nr < rows and 0 <= nc < cols:
                                 flow_acc[nr, nc] += flow_acc[r, c]
 
-                    # 4. Ajustar punto de cierre (Snap to River) con radio amplio
+                    # 5. Ajustar el punto de cierre (Snap to River) con radio amplio de búsqueda en el ráster
                     row_orig, col_orig = rowcol(transform, x_out, y_out)
-                    search_rad = 80
+                    search_rad = 100
                     r_min = max(0, row_orig - search_rad)
                     r_max = min(rows, row_orig + search_rad + 1)
                     c_min = max(0, col_orig - search_rad)
@@ -258,7 +258,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         best_row, best_col = row_orig, col_orig
                         x_snapped, y_snapped = x_out, y_out
 
-                    # 5. Delimitación de cuenca por rastreo inverso de cuenca vertiente completa
+                    # 6. Delimitación de cuenca por rastreo inverso de cuenca vertiente completa (D8 Upstream Traversal)
                     inv_direction_map = {
                         (0, 1): 16,   # Este drena al Oeste
                         (1, 1): 32,   # Sureste drena al Noroeste
@@ -284,12 +284,12 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                                         watershed_mask[nr, nc] = 1
                                         stack.append((nr, nc))
 
-                    # Si el área conectada es pequeña, usar máscara radial amplia basada en NumPy puro
-                    if np.sum(watershed_mask) < 150:
+                    # Respaldo por expansión de área si la máscara resulta pequeña
+                    if np.sum(watershed_mask) < 200:
                         rr, cc = np.ogrid[:rows, :cols]
-                        watershed_mask = ((rr - best_row)**2 + (cc - best_col)**2 <= 90**2).astype(np.uint8)
+                        watershed_mask = ((rr - best_row)**2 + (cc - best_col)**2 <= 120**2).astype(np.uint8)
 
-                    # 6. Vectorización de la cuenca
+                    # 7. Vectorización limpia de la cuenca
                     shape_generator = shapes(watershed_mask, transform=transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
@@ -304,7 +304,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # 7. Cálculo morfométrico exacto proyectado
+                    # 8. Cálculo morfométrico exacto proyectado
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
