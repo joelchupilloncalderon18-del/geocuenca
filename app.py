@@ -161,6 +161,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     import geopandas as gpd
                     import rasterio
                     import time
+                    import numpy as np
                     from rasterio.features import shapes
                     from shapely.geometry import shape
 
@@ -182,7 +183,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         y_out = float(st.session_state.y_outlet)
                         
                         if not (bounds.left <= x_out <= bounds.right and bounds.bottom <= y_out <= bounds.top):
-                            st.error(f"Error: Las coordenadas del aforo (X: {x_out:.2f}, Y: {y_out:.2f}) están fuera de los límites del DEM.")
+                            st.error(f"Error: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
                     f_watershed = os.path.join(base_dir, "watershed.tif")
@@ -203,30 +204,61 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     f_flow_acc = os.path.join(base_dir, "flow_acc.tif")
                     f_d8 = os.path.join(base_dir, "d8_pointer.tif")
 
-                    # Procesamiento hidrológico estándar
+                    # 1. Procesamiento hidrológico estándar
                     wbt.breach_depressions(dem_work, f_depressions)
                     wbt.d8_pointer(f_depressions, f_d8)
                     wbt.d8_flow_accumulation(f_depressions, f_flow_acc, out_type="cells")
 
-                    # Crear el archivo CSV de puntos de aforo directamente para Whitebox (sin usar shapefiles intermedios)
+                    # 2. Ajuste automático del punto de aforo al píxel de mayor acumulación de flujo cercano (Snap automático por Matriz)
+                    with rasterio.open(f_flow_acc) as acc_src:
+                        acc_data = acc_src.read(1)
+                        acc_transform = acc_src.transform
+                        
+                        # Convertir coordenadas geográficas/UTM a índices de matriz (fila, columna)
+                        from rasterio.transform import rowcol
+                        row, col = rowcol(acc_transform, x_out, y_out)
+                        
+                        # Definir una ventana de búsqueda de 15x15 píxeles alrededor del clic para encontrar el río
+                        window_size = 15
+                        r_min = max(0, row - window_size)
+                        r_max = min(acc_data.shape[0], row + window_size + 1)
+                        c_min = max(0, col - window_size)
+                        c_max = min(acc_data.shape[1], col + window_size + 1)
+                        
+                        sub_acc = acc_data[r_min:r_max, c_min:c_max]
+                        if sub_acc.size > 0 and not np.all(np.isnan(sub_acc)):
+                            # Encontrar el índice local con mayor acumulación de flujo (el cauce)
+                            sub_idx = np.nanargmax(sub_acc)
+                            sub_r, sub_c = np.unravel_index(sub_idx, sub_acc.shape)
+                            
+                            best_row = r_min + sub_r
+                            best_col = c_min + sub_c
+                            
+                            # Convertir de vuelta a coordenadas espaciales reales X, Y
+                            from rasterio.transform import xy
+                            x_snapped, y_snapped = xy(acc_transform, best_row, best_col)
+                        else:
+                            x_snapped, y_snapped = x_out, y_out
+
+                    # Escribir el punto ajustado en el CSV para WhiteboxTools
                     points_csv = os.path.join(base_dir, "outlet.csv")
                     with open(points_csv, "w") as f:
-                        f.write(f"X,Y\n{x_out},{y_out}\n")
+                        f.write(f"X,Y\n{x_snapped},{y_snapped}\n")
 
-                    # Ejecutar Watershed directamente con el CSV de coordenadas (evita errores de buffers en shapefiles)
+                    # 3. Ejecutar Watershed con el punto ajustado al cauce
                     wbt.watershed(f_d8, points_csv, f_watershed)
                     
-                    # Espera activa de escritura del ráster
+                    # Espera activa de escritura
                     for _ in range(15):
                         if os.path.exists(f_watershed) and os.path.getsize(f_watershed) > 0:
                             break
                         time.sleep(0.5)
 
                     if not os.path.exists(f_watershed) or os.path.getsize(f_watershed) == 0:
-                        st.error("WhiteboxTools no generó el ráster 'watershed.tif'. Verifique que las coordenadas del aforo caigan exactamente sobre el área activa del DEM.")
+                        st.error("No se pudo generar la cuenca. Asegúrese en la Fase 2 que el punto de aforo esté colocado claramente sobre una zona de acumulación (valle o cauce visible).")
                         st.stop()
 
-                    # Vectorización limpia con rasterio
+                    # Vectorización y cálculo final
                     with rasterio.open(f_watershed) as src:
                         watershed_data = src.read(1)
                         transform = src.transform
@@ -287,7 +319,8 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#1d4ed8', linewidth=2.2, alpha=0.95)
-                    ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Punto de Aforo')
+                    ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
+                    ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=90, label='Aforo Ajustado al Cauce')
                     ax.set_title("Cuenca Delimitada (GeoCuenca v1.0)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
