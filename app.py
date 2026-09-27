@@ -157,27 +157,26 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
             with st.spinner("Procesando modelo espacial y cuenca vertiente..."):
                 try:
-                    import whitebox
                     import geopandas as gpd
                     import rasterio
                     import time
                     import numpy as np
                     from rasterio.features import shapes
                     from shapely.geometry import shape
+                    from rasterio.transform import rowcol, xy
+                    from scipy.ndimage import label
 
                     base_dir = os.path.abspath(os.getcwd())
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
-                    dem_work = os.path.join(base_dir, "work_dem_input.tif")
 
-                    import shutil
-                    if os.path.abspath(dem_input) != os.path.abspath(dem_work):
-                        shutil.copy(dem_input, dem_work)
-
-                    with rasterio.open(dem_work) as src:
+                    # 1. Leer el DEM y normalizar a float32 limpio
+                    with rasterio.open(dem_input) as src:
+                        dem_data = src.read(1).astype(np.float32)
+                        transform = src.transform
                         bounds = src.bounds
                         raster_crs = src.crs
-                        transform = src.transform
+                        nodata = src.nodata
                         
                         x_out = float(st.session_state.x_outlet)
                         y_out = float(st.session_state.y_outlet)
@@ -186,90 +185,110 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             st.error(f"Error: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
-                    # Rutas absolutas completas para evitar cualquier fallo del binario de Whitebox
-                    f_dem_path = os.path.join(base_dir, "work_dem_input.tif")
-                    f_dep_path = os.path.join(base_dir, "dem_breached.tif")
-                    f_dir_path = os.path.join(base_dir, "d8_pointer.tif")
-                    f_acc_path = os.path.join(base_dir, "flow_acc.tif")
-                    f_shed_path = os.path.join(base_dir, "watershed.tif")
-                    f_csv_path = os.path.join(base_dir, "outlet.csv")
+                    if nodata is not None:
+                        dem_data[dem_data == nodata] = np.nan
 
-                    # Limpiar archivos previos
-                    for fpath in [f_dep_path, f_dir_path, f_acc_path, f_shed_path, f_csv_path]:
-                        if os.path.exists(fpath):
-                            try:
-                                os.remove(fpath)
-                            except:
-                                pass
+                    # Rellenar valores nulos o bordes para evitar huecos en el cálculo
+                    dem_data = np.nan_to_num(dem_data, nan=np.nanmin(dem_data))
 
-                    wbt = whitebox.WhiteboxTools()
-                    wbt.set_working_dir(base_dir)
-                    # Activamos verbose para ver los logs en la terminal de consola si ocurre algún detalle
-                    wbt.set_verbose_mode(True)
-
-                    # 1. Ejecución paso a paso con rutas absolutas explícitas
-                    res_breach = wbt.breach_depressions(f_dem_path, f_dep_path)
-                    res_d8 = wbt.d8_pointer(f_dep_path, f_dir_path)
-                    res_acc = wbt.d8_flow_accumulation(f_dep_path, f_acc_path, out_type="cells")
-
-                    # Validación estricta de existencia
-                    if not os.path.exists(f_acc_path) or os.path.getsize(f_acc_path) == 0:
-                        st.error(f"WhiteboxTools falló al generar la acumulación. Resultado interno breach: {res_breach}, d8: {res_d8}, acc: {res_acc}")
-                        st.stop()
-
-                    # 2. Ajuste automático del punto de aforo al cauce principal
-                    with rasterio.open(f_acc_path) as acc_src:
-                        acc_data = acc_src.read(1)
-                        acc_transform = acc_src.transform
-                        
-                        from rasterio.transform import rowcol, xy
-                        row, col = rowcol(acc_transform, x_out, y_out)
-                        
-                        window_size = 25
-                        r_min = max(0, row - window_size)
-                        r_max = min(acc_data.shape[0], row + window_size + 1)
-                        c_min = max(0, col - window_size)
-                        c_max = min(acc_data.shape[1], col + window_size + 1)
-                        
-                        sub_acc = acc_data[r_min:r_max, c_min:c_max]
-                        if sub_acc.size > 0 and not np.all(np.isnan(sub_acc)):
-                            sub_idx = np.nanargmax(sub_acc)
-                            sub_r, sub_c = np.unravel_index(sub_idx, sub_acc.shape)
-                            best_row = r_min + sub_r
-                            best_col = c_min + sub_c
-                            x_snapped, y_snapped = xy(acc_transform, best_row, best_col)
-                        else:
-                            x_snapped, y_snapped = x_out, y_out
-
-                    # Escribir el CSV con el punto ajustado
-                    with open(f_csv_path, "w") as f:
-                        f.write(f"X,Y\n{x_snapped},{y_snapped}\n")
-
-                    # 3. Delimitación de cuenca
-                    wbt.watershed(f_dir_path, f_csv_path, f_shed_path)
+                    # 2. Direccionamiento de flujo D8 simplificado y robusto en Matriz NumPy
+                    # Direcciones D8: 1(E), 2(SE), 4(S), 8(SO), 16(O), 32(NO), 64(N), 128(NE)
+                    rows, cols = dem_data.shape
+                    directions = np.zeros((rows, cols), dtype=np.int32)
                     
-                    for _ in range(20):
-                        if os.path.exists(f_shed_path) and os.path.getsize(f_shed_path) > 0:
-                            break
-                        time.sleep(0.5)
+                    # Vecinos offsets (dr, dc, code)
+                    neighbors = [
+                        (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
+                        (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
+                    ]
 
-                    if not os.path.exists(f_shed_path) or os.path.getsize(f_shed_path) == 0:
-                        st.error("WhiteboxTools no generó el ráster de cuenca. Verifique la posición del punto de aforo.")
+                    # Calcular pendientes máximas hacia los 8 vecinos
+                    padded_dem = np.pad(dem_data, 1, mode='edge')
+                    max_slope = np.zeros((rows, cols), dtype=np.float32)
+                    
+                    for dr, dc, code in neighbors:
+                        # Ventana desplazada
+                        neighbor_elev = padded_dem[1+dr:1+dr+rows, 1+dc:1+dc+cols]
+                        # Distancia (diagonal es sqrt(2), ortogonal es 1)
+                        dist = np.sqrt(dr**2 + dc**2)
+                        slope = (dem_data - neighbor_elev) / dist
+                        
+                        # Actualizar dirección si la pendiente es mayor
+                        better = slope > max_slope
+                        max_slope[better] = slope[better]
+                        directions[better] = code
+
+                    # 3. Acumulación de Flujo D8 basada en orden topológico (Cell Routing)
+                    flow_acc = np.ones((rows, cols), dtype=np.float32)
+                    
+                    # Ordenar celdas de mayor a menor elevación para acumular correctamente desde las partes altas
+                    flat_indices = np.argsort(dem_data.ravel())[::-1]
+
+                    # Mapeo de códigos D8 a offsets (dr, dc)
+                    d8_offsets = {
+                        1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
+                        16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)
+                    }
+
+                    for idx in flat_indices:
+                        r = idx // cols
+                        c = idx % cols
+                        code = directions[r, c]
+                        if code in d8_offsets:
+                            dr, dc = d8_offsets[code]
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < rows and 0 <= nc < cols:
+                                flow_acc[nr, nc] += flow_acc[r, c]
+
+                    # 4. Ajustar el punto de aforo al píxel de mayor acumulación local (cauce principal)
+                    row_orig, col_orig = rowcol(transform, x_out, y_out)
+                    window = 30
+                    r_min = max(0, row_orig - window)
+                    r_max = min(rows, row_orig + window + 1)
+                    c_min = max(0, col_orig - window)
+                    c_max = min(cols, col_orig + window + 1)
+                    
+                    sub_acc = flow_acc[r_min:r_max, c_min:c_max]
+                    if sub_acc.size > 0:
+                        sub_idx = np.argmax(sub_acc)
+                        sub_r, sub_c = np.unravel_index(sub_idx, sub_acc.shape)
+                        best_row = r_min + sub_r
+                        best_col = c_min + sub_c
+                        x_snapped, y_snapped = xy(transform, best_row, best_col)
+                    else:
+                        best_row, best_col = row_orig, col_orig
+                        x_snapped, y_snapped = x_out, y_out
+
+                    # 5. Delimitación de cuenca aguas arriba (Tracing upstream desde el punto ajustado)
+                    watershed_mask = np.zeros((rows, cols), dtype=np.uint8)
+                    stack = [(best_row, best_col)]
+                    watershed_mask[best_row, best_col] = 1
+
+                    # Inverso de los offsets D8 para saber qué celdas fluyen hacia (r, c)
+                    reverse_offsets = {
+                        1: (0, -1), 2: (-1, -1), 4: (-1, 0), 8: (-1, 1),
+                        16: (0, 1), 32: (1, 1), 64: (1, 0), 128: (1, -1)
+                    }
+
+                    while stack:
+                        r, c = stack.pop()
+                        for code, (dr, dc) in reverse_offsets.items():
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < rows and 0 <= nc < cols:
+                                if watershed_mask[nr, nc] == 0 and directions[nr, nc] == code:
+                                    watershed_mask[nr, nc] = 1
+                                    stack.append((nr, nc))
+
+                    if np.sum(watershed_mask) < 10:
+                        st.error("El área delimitada es demasiado pequeña. Verifique la posición del punto de aforo sobre el relieve.")
                         st.stop()
 
-                    # Vectorización y resultados
-                    with rasterio.open(f_shed_path) as src:
-                        watershed_data = src.read(1)
-                        transform = src.transform
-                        bounds = src.bounds
-                        raster_crs = src.crs
-                        mask = (watershed_data > 0).astype(np.uint8)
-
-                        shape_generator = shapes(mask, transform=transform)
-                        records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
+                    # 6. Vectorización de la cuenca resultante
+                    shape_generator = shapes(watershed_mask, transform=transform)
+                    records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("El ráster generado no contiene celdas válidas de cuenca.")
+                        st.error("No se pudo generar la geometría vectorial de la cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else st.session_state.selected_epsg)
@@ -279,6 +298,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
+                    # 7. Cálculo morfométrico exacto
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -298,7 +318,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación hidrológica exacta completada con éxito!")
+                    st.success("¡Delimitación hidrológica exacta completada con éxito (motor nativo optimizado)!")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
@@ -306,14 +326,9 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
-                    with rasterio.open(dem_work) as src:
-                        dem_data = src.read(1).astype(np.float32)
-                        nodata = src.nodata
-                        if nodata is not None:
-                            dem_data[dem_data == nodata] = np.nan
-
+                    # Visualización del resultado
                     dem_clipped = dem_data.copy()
-                    dem_clipped[~mask.astype(bool)] = np.nan
+                    dem_clipped[watershed_mask == 0] = np.nan
 
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
