@@ -52,11 +52,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Inicializar WhiteboxTools con directorio temporal seguro para la nube
-    import tempfile
-    tmp_dir = tempfile.gettempdir()
-    wbt = whitebox.WhiteboxTools()
-    wbt.set_working_dir(tmp_dir)
-    wbt.set_verbose_mode(False)
+import tempfile
+tmp_dir = tempfile.gettempdir()
+wbt = whitebox.WhiteboxTools()
+wbt.set_working_dir(tmp_dir)
+wbt.set_verbose_mode(False)
 
 if 'dem_loaded' not in st.session_state:
     st.session_state.dem_loaded = False
