@@ -175,7 +175,12 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     f_watershed = os.path.join(base_dir, "watershed.tif")
                     
-                    # Ejecución de WhiteboxTools
+                    # Eliminar resultados anteriores si existieran para forzar cálculo limpio
+                    for f_temp in [f_watershed, os.path.join(base_dir, "dem_breached.tif"), os.path.join(base_dir, "flow_acc.tif"), os.path.join(base_dir, "d8_pointer.tif")]:
+                        if os.path.exists(f_temp):
+                            os.remove(f_temp)
+
+                    # Ejecución de WhiteboxTools paso a paso
                     wbt = whitebox.WhiteboxTools()
                     wbt.set_working_dir(base_dir)
                     wbt.set_verbose_mode(False)
@@ -193,39 +198,20 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         f.write(f"X,Y\n{st.session_state.x_outlet},{st.session_state.y_outlet}\n")
 
                     f_snap = os.path.join(base_dir, "outlet_snap.shp")
-                    wbt.snap_pour_points(points_csv, f_flow_acc, f_snap, snap_dist=50.0)
+                    wbt.snap_pour_points(points_csv, f_flow_acc, f_snap, snap_dist=100.0)
                     wbt.watershed(f_d8, f_snap, f_watershed)
                     
-                    # Pausa breve para asegurar escritura en disco de Linux
-                    time.sleep(1.0)
+                    # Esperar y verificar que el archivo de Whitebox se haya escrito físicamente
+                    for _ in range(10):
+                        if os.path.exists(f_watershed) and os.path.getsize(f_watershed) > 0:
+                            break
+                        time.sleep(0.5)
 
-                    # Respaldo geométrico puro con numpy si WhiteboxTools no generara el archivo en la nube
-                    if not os.path.exists(f_watershed):
-                        with rasterio.open(dem_work) as src:
-                            dem_data = src.read(1).astype(np.float32)
-                            transform = src.transform
-                            nodata = src.nodata
-                            profile = src.profile
-                        if nodata is not None:
-                            dem_data[dem_data == nodata] = np.nan
-                        
-                        col_idx, row_idx = ~transform * (st.session_state.x_outlet, st.session_state.y_outlet)
-                        row_idx, col_idx = int(round(row_idx)), int(round(col_idx))
-                        rows, cols = dem_data.shape
-                        
-                        basin_mask = np.zeros((rows, cols), dtype=np.uint8)
-                        if 0 <= row_idx < rows and 0 <= col_idx < cols:
-                            y_ind, x_ind = np.ogrid[:rows, :cols]
-                            # Máscara radial de respaldo basada en la distancia al punto de aforo
-                            basin_mask = (np.sqrt((x_ind - col_idx)**2 + (y_ind - row_idx)**2) <= (min(rows, cols) * 0.35)).astype(np.uint8)
-                        else:
-                            basin_mask = (~np.isnan(dem_data)).astype(np.uint8)
+                    if not os.path.exists(f_watershed) or os.path.getsize(f_watershed) == 0:
+                        st.error("Error crítico: WhiteboxTools no generó el ráster de cuenca. Verifique las coordenadas del punto de aforo (deben estar dentro de los límites del DEM).")
+                        st.stop()
 
-                        profile.update(dtype=rasterio.uint8, count=1, nodata=0)
-                        with rasterio.open(f_watershed, 'w', **profile) as dst:
-                            dst.write(basin_mask, 1)
-
-                    # Vectorización y lectura del CRS real del raster
+                    # Vectorización directa del ráster real generado por Whitebox
                     with rasterio.open(f_watershed) as src:
                         watershed_data = src.read(1)
                         transform = src.transform
@@ -237,7 +223,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("No se pudo vectorizar la cuenca.")
+                        st.error("No se pudo vectorizar la cuenca a partir del modelo hidrológico.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else st.session_state.selected_epsg)
@@ -247,7 +233,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # Proyección automática a UTM para garantizar el cálculo exacto en km2 y km
+                    # Proyección automática a UTM para cálculo exacto en km2 y km
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -264,10 +250,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     
                     area_km2 = area_m2 / 1_000_000
                     perimetro_km = perimetro_m / 1_000
-                    
-                    if area_km2 < 0.05:
-                        area_km2 = 18.45
-                        perimetro_km = 24.20
 
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
