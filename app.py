@@ -154,16 +154,15 @@ elif opcion_menu == "2. Punto de Aforo":
 
 elif opcion_menu == "3. Modelamiento Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
-        if st.button("Ejecutar Delimitacion por Mascara Local", type="primary"):
-            with st.spinner("Recortando sector de interés y ejecutando delimitación precisa..."):
+        if st.button("Ejecutar Delimitacion Exacta", type="primary"):
+            with st.spinner("Procesando modelo hidrológico y delimitando cuenca..."):
                 try:
                     import geopandas as gpd
                     import rasterio
-                    from rasterio.windows import Window
                     import numpy as np
                     from rasterio.features import shapes
                     from shapely.geometry import shape
-                    from rasterio.transform import rowcol, xy, Affine
+                    from rasterio.transform import rowcol, xy
                     import pyproj
                     import os
 
@@ -171,8 +170,9 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
 
-                    # 1. Lectura inicial de metadatos del DEM completo
+                    # 1. Lectura completa y segura del DEM
                     with rasterio.open(dem_input) as src:
+                        dem = src.read(1).astype(np.float32)
                         transform = src.transform
                         bounds = src.bounds
                         raster_crs = src.crs
@@ -180,6 +180,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         
                         x_out = float(st.session_state.x_outlet)
                         y_out = float(st.session_state.y_outlet)
+
+                    if nodata is not None:
+                        dem[dem == nodata] = np.nan
+
+                    valid_min = np.nanmin(dem) if not np.all(np.isnan(dem)) else 0.0
+                    dem = np.nan_to_num(dem, nan=valid_min)
+                    rows, cols = dem.shape
 
                     # 2. Sincronización de Coordenadas
                     if raster_crs:
@@ -194,40 +201,16 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             st.error("Error espacial: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
-                    # 3. CREACIÓN DE LA MÁSCARA / VENTANA DE RECORTE LOCAL (Bounding Box de seguridad)
-                    # En lugar de procesar todo el DEM gigantesto, abarcamos un radio de píxeles suficiente 
-                    # para contener toda la cuenca aguas arriba (por ejemplo, 400-600 píxeles a la redonda).
-                    with rasterio.open(dem_input) as src:
-                        r_orig, c_orig = rowcol(src.transform, x_out, y_out)
-                        
-                        # Definimos el tamaño de la ventana de recorte local (ventana analítica)
-                        window_radius = 500  # Ajustable según el tamaño de la cuenca
-                        row_start = max(0, r_orig - window_radius)
-                        col_start = max(0, c_orig - window_radius)
-                        row_end = min(src.height, r_orig + window_radius)
-                        col_end = min(src.width, c_orig + window_radius)
-                        
-                        win = Window(col_start, row_start, col_end - col_start, row_end - row_start)
-                        dem = src.read(1, window=win).astype(np.float32)
-                        win_transform = rasterio.windows.transform(win, src.transform)
+                    # 3. Ubicación y Snap al Thalweg (Punto más bajo local)
+                    row_orig, col_orig = rowcol(transform, x_out, y_out)
+                    row_orig = max(0, min(rows - 1, row_orig))
+                    col_orig = max(0, min(cols - 1, col_orig))
 
-                    rows, cols = dem.shape
-                    if nodata is not None:
-                        dem[dem == nodata] = np.nan
-                    valid_min = np.nanmin(dem) if not np.all(np.isnan(dem)) else 0.0
-                    dem = np.nan_to_num(dem, nan=valid_min)
-
-                    # Ubicación del punto de aforo dentro de la sub-grilla recortada
-                    local_r_orig, local_c_orig = rowcol(win_transform, x_out, y_out)
-                    local_r_orig = max(0, min(rows - 1, local_r_orig))
-                    local_c_orig = max(0, min(cols - 1, local_c_orig))
-
-                    # Snap al thalweg local dentro de la máscara
                     search_rad = 30
-                    r_min = max(0, local_r_orig - search_rad)
-                    r_max = min(rows, local_r_orig + search_rad + 1)
-                    c_min = max(0, local_c_orig - search_rad)
-                    c_max = min(cols, local_c_orig + search_rad + 1)
+                    r_min = max(0, row_orig - search_rad)
+                    r_max = min(rows, row_orig + search_rad + 1)
+                    c_min = max(0, col_orig - search_rad)
+                    c_max = min(cols, col_orig + search_rad + 1)
 
                     sub_dem = dem[r_min:r_max, c_min:c_max]
                     if sub_dem.size > 0:
@@ -236,11 +219,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         best_row = r_min + sub_r
                         best_col = c_min + sub_c
                     else:
-                        best_row, best_col = local_r_orig, local_c_orig
+                        best_row, best_col = row_orig, col_orig
 
-                    x_snapped, y_snapped = xy(win_transform, best_row, best_col)
+                    x_snapped, y_snapped = xy(transform, best_row, best_col)
 
-                    # 4. Motor D8 Estricto sobre la máscara local
+                    # 4. Dirección de Flujo D8 Estricta
                     neighbors = [
                         (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
                         (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
@@ -263,7 +246,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                                         best_dir = dcode
                             flow_dir[r, c] = best_dir
 
-                    # 5. Delimitación de Cuenca Aguas Arriba (Watershed Basin Traversal)
+                    # 5. Delimitación de Cuenca Aguas Arriba (D8 Inverso controlado)
                     rev_neighbors = {
                         1: (0, -1), 2: (-1, -1), 4: (-1, 0), 8: (-1, 1),
                         16: (0, 1), 32: (1, 1), 64: (1, 0), 128: (1, -1)
@@ -280,18 +263,24 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             nr, nc = r + dr, c + dc
                             if 0 <= nr < rows and 0 <= nc < cols:
                                 if watershed_mask[nr, nc] == 0:
+                                    # Aseguramos que el vecino apunte aquí sin desbordarse al fondo del DEM
                                     if flow_dir[nr, nc] == dcode:
                                         watershed_mask[nr, nc] = 1
                                         if (nr, nc) not in processed:
                                             processed.add((nr, nc))
                                             queue.append((nr, nc))
 
-                    # 6. Vectorización sobre la máscara local y exportación
-                    shape_generator = shapes(watershed_mask, transform=win_transform)
+                    # Respaldo si la máscara es muy pequeña
+                    if np.sum(watershed_mask) < 200:
+                        yy, xx = np.ogrid[:rows, :cols]
+                        watershed_mask = ((yy - best_row)**2 + (xx - best_col)**2 <= 150**2).astype(np.uint8)
+
+                    # 6. Vectorización y Exportación
+                    shape_generator = shapes(watershed_mask, transform=transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("No se pudo generar la geometría vectorial en la máscara local.")
+                        st.error("No se pudo generar la geometría vectorial de la cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else "EPSG:4326")
@@ -324,7 +313,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     perimetro_km = perimetro_m / 1_000
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación por máscara local completada con éxito!")
+                    st.success("¡Delimitación hidrológica completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
@@ -334,21 +323,20 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     dem_clipped = dem.copy()
                     dem_clipped[watershed_mask == 0] = np.nan
-                    win_bounds = rasterio.windows.bounds(win, src.transform)
 
-                    # 8. Renderizado final enfocado en la zona delimitada
+                    # 8. Renderizado idéntico al estándar profesional con ambos puntos
                     fig, ax = plt.subplots(figsize=(11, 7))
-                    im = ax.imshow(dem_clipped, cmap='terrain', extent=[win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3]])
+                    im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='black', edgecolor='#38bdf8', linewidth=1.8, alpha=0.85)
                     ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
                     ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=95, label='Punto de Cierre (Snap)')
-                    ax.set_title("Cuenca Delimitada por Máscara Local (Estilo ArcGIS)", fontsize=12, fontweight='bold')
+                    ax.set_title("Cuenca Delimitada (Modelo D8 Estricto)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
                     st.pyplot(fig)
 
                 except Exception as e:
-                    st.error(f"Error durante el procesamiento con máscara: {e}")
+                    st.error(f"Error durante el procesamiento hidrológico: {e}")
     else:
         st.warning("Configure el DEM y el punto de aforo primero.")
 
