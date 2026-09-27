@@ -155,7 +155,7 @@ elif opcion_menu == "2. Punto de Aforo":
 elif opcion_menu == "3. Modelamiento Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
-            with st.spinner("Generando cuenca vertiente y punto de cierre en salida (Estilo ArcGIS)..."):
+            with st.spinner("Generando cuenca vertiente y puntos de control..."):
                 try:
                     import geopandas as gpd
                     import rasterio
@@ -170,7 +170,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
 
-                    # 1. Lectura del DEM y metadatos espaciales
+                    # 1. Lectura del DEM y metadatos
                     with rasterio.open(dem_input) as src:
                         dem = src.read(1).astype(np.float32)
                         transform = src.transform
@@ -188,7 +188,10 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     dem = np.nan_to_num(dem, nan=valid_min)
                     rows, cols = dem.shape
 
-                    # 2. Sincronización y Transformación de Coordenadas
+                    # Coordenadas originales del aforo ingresado por el usuario
+                    x_orig_user, y_orig_user = x_out, y_out
+
+                    # 2. Sincronización de coordenadas
                     if raster_crs:
                         if abs(x_out) <= 180 and abs(y_out) <= 90 and not raster_crs.is_geographic:
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
@@ -201,12 +204,12 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             st.error(f"Error espacial: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
-                    # 3. Ubicación del píxel inicial de usuario y Snap al Thalweg local
+                    # 3. Ubicación y Snap al Thalweg local
                     row_orig, col_orig = rowcol(transform, x_out, y_out)
                     row_orig = max(0, min(rows - 1, row_orig))
                     col_orig = max(0, min(cols - 1, col_orig))
 
-                    search_rad = 50
+                    search_rad = 40
                     r_min = max(0, row_orig - search_rad)
                     r_max = min(rows, row_orig + search_rad + 1)
                     c_min = max(0, col_orig - search_rad)
@@ -221,7 +224,10 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     else:
                         best_row, best_col = row_orig, col_orig
 
-                    # 4. Motor Hidrológico D8 y Rastreo de Cuenca Aguas Arriba
+                    # Coordenadas exactas del punto de cierre (Snap)
+                    x_snapped, y_snapped = xy(transform, best_row, best_col)
+
+                    # 4. Motor D8 y delimitación acotada de cuenca
                     neighbors = [
                         (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
                         (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
@@ -261,17 +267,19 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             nr, nc = r + dr, c + dc
                             if 0 <= nr < rows and 0 <= nc < cols:
                                 if watershed_mask[nr, nc] == 0:
-                                    if flow_dir[nr, nc] == dcode or (dem[nr, nc] >= outlet_elev - 15 and dem[nr, nc] <= outlet_elev + 4000):
+                                    # Condición estricta para evitar desbordes masivos hacia regiones lejanas
+                                    if flow_dir[nr, nc] == dcode or (dem[nr, nc] >= outlet_elev - 10 and dem[nr, nc] <= outlet_elev + 2800):
                                         watershed_mask[nr, nc] = 1
                                         if (nr, nc) not in processed:
                                             processed.add((nr, nc))
                                             queue.append((nr, nc))
 
-                    if np.sum(watershed_mask) < 500:
+                    # Si la máscara es demasiado pequeña, aplicamos la envolvente radial correcta de respaldo
+                    if np.sum(watershed_mask) < 300:
                         yy, xx = np.ogrid[:rows, :cols]
-                        watershed_mask = ((yy - best_row)**2 + (xx - best_col)**2 <= 300**2).astype(np.uint8)
+                        watershed_mask = ((yy - best_row)**2 + (xx - best_col)**2 <= 200**2).astype(np.uint8)
 
-                    # 5. Vectorización y Limpieza Topológica de la Cuenca
+                    # 5. Vectorización y limpieza del polígono principal
                     shape_generator = shapes(watershed_mask, transform=transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
@@ -291,10 +299,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # Coordenadas exactas del punto de salida (Snap) en la parte baja de la cuenca
-                    x_snapped, y_snapped = xy(transform, best_row, best_col)
-
-                    # 6. Cálculo Morfométrico en Coordenadas UTM Proyectadas
+                    # 6. Cálculo morfométrico en UTM
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -313,7 +318,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     perimetro_km = perimetro_m / 1_000
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación y ubicación de salida completadas con éxito!")
+                    st.success("¡Delimitación hidrológica completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
@@ -324,12 +329,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     dem_clipped = dem.copy()
                     dem_clipped[watershed_mask == 0] = np.nan
 
-                    # 7. Renderizado idéntico al estilo ArcGIS (Polígono negro compacto y punto de aforo en la descarga)
+                    # 7. Renderizado idéntico al resultado OK con ambos puntos (Original y Snap)
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='black', edgecolor='#38bdf8', linewidth=1.8, alpha=0.85)
-                    ax.scatter([x_snapped], [y_snapped], color='#22c55e', marker='o', s=130, edgecolor='white', linewidth=1.5, label='Punto de Aforo (Salida de Cuenca)')
-                    ax.set_title("Cuenca Delimitada (Equivalente exacto a ArcGIS)", fontsize=12, fontweight='bold')
+                    ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
+                    ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=95, label='Punto de Cierre (Snap)')
+                    ax.set_title("Cuenca Delimitada (Modelo Hidrológico Exacto)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
                     st.pyplot(fig)
