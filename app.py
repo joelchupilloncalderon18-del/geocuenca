@@ -165,7 +165,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     from rasterio.features import shapes
                     from shapely.geometry import shape
 
-                    # Directorio de trabajo absoluto y limpio
                     base_dir = os.path.abspath(os.getcwd())
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
@@ -187,17 +186,16 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             st.error(f"Error: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
-                    # Nombres limpios para Whitebox (sin rutas relativas complejas)
-                    f_dem_name = "work_dem_input.tif"
-                    f_dep_name = "dem_breached.tif"
-                    f_dir_name = "d8_pointer.tif"
-                    f_acc_name = "flow_acc.tif"
-                    f_shed_name = "watershed.tif"
-                    f_csv_name = "outlet.csv"
+                    # Rutas absolutas completas para evitar cualquier fallo del binario de Whitebox
+                    f_dem_path = os.path.join(base_dir, "work_dem_input.tif")
+                    f_dep_path = os.path.join(base_dir, "dem_breached.tif")
+                    f_dir_path = os.path.join(base_dir, "d8_pointer.tif")
+                    f_acc_path = os.path.join(base_dir, "flow_acc.tif")
+                    f_shed_path = os.path.join(base_dir, "watershed.tif")
+                    f_csv_path = os.path.join(base_dir, "outlet.csv")
 
                     # Limpiar archivos previos
-                    for fname in [f_dep_name, f_dir_name, f_acc_name, f_shed_name, f_csv_name]:
-                        fpath = os.path.join(base_dir, fname)
+                    for fpath in [f_dep_path, f_dir_path, f_acc_path, f_shed_path, f_csv_path]:
                         if os.path.exists(fpath):
                             try:
                                 os.remove(fpath)
@@ -206,19 +204,20 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     wbt = whitebox.WhiteboxTools()
                     wbt.set_working_dir(base_dir)
-                    wbt.set_verbose_mode(False)
+                    # Activamos verbose para ver los logs en la terminal de consola si ocurre algún detalle
+                    wbt.set_verbose_mode(True)
 
-                    # 1. Ejecutar herramientas de Whitebox usando nombres base limpios
-                    wbt.breach_depressions(f_dem_name, f_dep_name)
-                    wbt.d8_pointer(f_dep_name, f_dir_name)
-                    wbt.d8_flow_accumulation(f_dep_name, f_acc_name, out_type="cells")
+                    # 1. Ejecución paso a paso con rutas absolutas explícitas
+                    res_breach = wbt.breach_depressions(f_dem_path, f_dep_path)
+                    res_d8 = wbt.d8_pointer(f_dep_path, f_dir_path)
+                    res_acc = wbt.d8_flow_accumulation(f_dep_path, f_acc_path, out_type="cells")
 
-                    f_acc_path = os.path.join(base_dir, f_acc_name)
-                    if not os.path.exists(f_acc_path):
-                        st.error("Error crítico: WhiteboxTools no generó el ráster de acumulación de flujo.")
+                    # Validación estricta de existencia
+                    if not os.path.exists(f_acc_path) or os.path.getsize(f_acc_path) == 0:
+                        st.error(f"WhiteboxTools falló al generar la acumulación. Resultado interno breach: {res_breach}, d8: {res_d8}, acc: {res_acc}")
                         st.stop()
 
-                    # 2. Ajuste automático del punto de aforo al cauce principal mediante matriz
+                    # 2. Ajuste automático del punto de aforo al cauce principal
                     with rasterio.open(f_acc_path) as acc_src:
                         acc_data = acc_src.read(1)
                         acc_transform = acc_src.transform
@@ -243,14 +242,12 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             x_snapped, y_snapped = x_out, y_out
 
                     # Escribir el CSV con el punto ajustado
-                    csv_path = os.path.join(base_dir, f_csv_name)
-                    with open(csv_path, "w") as f:
+                    with open(f_csv_path, "w") as f:
                         f.write(f"X,Y\n{x_snapped},{y_snapped}\n")
 
                     # 3. Delimitación de cuenca
-                    wbt.watershed(f_dir_name, f_csv_name, f_shed_name)
+                    wbt.watershed(f_dir_path, f_csv_path, f_shed_path)
                     
-                    f_shed_path = os.path.join(base_dir, f_shed_name)
                     for _ in range(20):
                         if os.path.exists(f_shed_path) and os.path.getsize(f_shed_path) > 0:
                             break
