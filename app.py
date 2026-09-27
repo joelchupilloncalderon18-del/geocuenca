@@ -165,7 +165,8 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     from rasterio.features import shapes
                     from shapely.geometry import shape
 
-                    base_dir = "/tmp" if os.path.exists("/tmp") else os.getcwd()
+                    # Usar siempre el directorio de trabajo actual para evitar problemas de permisos o carpetas fantasma
+                    base_dir = os.getcwd()
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
                     dem_work = os.path.join(base_dir, "work_dem_input.tif")
@@ -186,13 +187,18 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             st.error(f"Error: Las coordenadas del aforo están fuera de los límites del DEM.")
                             st.stop()
 
-                    f_watershed = os.path.join(base_dir, "watershed.tif")
-                    
-                    # Limpiar archivos previos
-                    for f_temp in [f_watershed, os.path.join(base_dir, "dem_breached.tif"), os.path.join(base_dir, "flow_acc.tif"), os.path.join(base_dir, "d8_pointer.tif"), os.path.join(base_dir, "outlet.csv")]:
-                        if os.path.exists(f_temp):
+                    f_watershed = "watershed.tif"
+                    f_depressions = "dem_breached.tif"
+                    f_flow_acc = "flow_acc.tif"
+                    f_d8 = "d8_pointer.tif"
+                    points_csv = "outlet.csv"
+
+                    # Limpiar archivos previos de forma segura
+                    for f_name in [f_watershed, f_depressions, f_flow_acc, f_d8, points_csv]:
+                        f_path = os.path.join(base_dir, f_name)
+                        if os.path.exists(f_path):
                             try:
-                                os.remove(f_temp)
+                                os.remove(f_path)
                             except:
                                 pass
 
@@ -200,26 +206,26 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     wbt.set_working_dir(base_dir)
                     wbt.set_verbose_mode(False)
 
-                    f_depressions = os.path.join(base_dir, "dem_breached.tif")
-                    f_flow_acc = os.path.join(base_dir, "flow_acc.tif")
-                    f_d8 = os.path.join(base_dir, "d8_pointer.tif")
-
-                    # 1. Procesamiento hidrológico estándar
-                    wbt.breach_depressions(dem_work, f_depressions)
+                    # 1. Procesamiento hidrológico básico
+                    wbt.breach_depressions("work_dem_input.tif", f_depressions)
                     wbt.d8_pointer(f_depressions, f_d8)
                     wbt.d8_flow_accumulation(f_depressions, f_flow_acc, out_type="cells")
 
-                    # 2. Ajuste automático del punto de aforo al píxel de mayor acumulación de flujo cercano (Snap automático por Matriz)
-                    with rasterio.open(f_flow_acc) as acc_src:
+                    # Verificar que flow_acc.tif realmente exista antes de continuar
+                    f_flow_acc_path = os.path.join(base_dir, f_flow_acc)
+                    if not os.path.exists(f_flow_acc_path):
+                        st.error("Error crítico: WhiteboxTools no pudo calcular la acumulación de flujo.")
+                        st.stop()
+
+                    # 2. Ajuste automático del punto de aforo al cauce usando la matriz de acumulación
+                    with rasterio.open(f_flow_acc_path) as acc_src:
                         acc_data = acc_src.read(1)
                         acc_transform = acc_src.transform
                         
-                        # Convertir coordenadas geográficas/UTM a índices de matriz (fila, columna)
-                        from rasterio.transform import rowcol
+                        from rasterio.transform import rowcol, xy
                         row, col = rowcol(acc_transform, x_out, y_out)
                         
-                        # Definir una ventana de búsqueda de 15x15 píxeles alrededor del clic para encontrar el río
-                        window_size = 15
+                        window_size = 20
                         r_min = max(0, row - window_size)
                         r_max = min(acc_data.shape[0], row + window_size + 1)
                         c_min = max(0, col - window_size)
@@ -227,39 +233,35 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         
                         sub_acc = acc_data[r_min:r_max, c_min:c_max]
                         if sub_acc.size > 0 and not np.all(np.isnan(sub_acc)):
-                            # Encontrar el índice local con mayor acumulación de flujo (el cauce)
                             sub_idx = np.nanargmax(sub_acc)
                             sub_r, sub_c = np.unravel_index(sub_idx, sub_acc.shape)
                             
                             best_row = r_min + sub_r
                             best_col = c_min + sub_c
                             
-                            # Convertir de vuelta a coordenadas espaciales reales X, Y
-                            from rasterio.transform import xy
                             x_snapped, y_snapped = xy(acc_transform, best_row, best_col)
                         else:
                             x_snapped, y_snapped = x_out, y_out
 
-                    # Escribir el punto ajustado en el CSV para WhiteboxTools
-                    points_csv = os.path.join(base_dir, "outlet.csv")
-                    with open(points_csv, "w") as f:
+                    # Escribir el CSV limpio con las coordenadas ajustadas en el directorio local
+                    with open(os.path.join(base_dir, points_csv), "w") as f:
                         f.write(f"X,Y\n{x_snapped},{y_snapped}\n")
 
-                    # 3. Ejecutar Watershed con el punto ajustado al cauce
+                    # 3. Ejecutar Watershed
                     wbt.watershed(f_d8, points_csv, f_watershed)
                     
-                    # Espera activa de escritura
-                    for _ in range(15):
-                        if os.path.exists(f_watershed) and os.path.getsize(f_watershed) > 0:
+                    f_watershed_path = os.path.join(base_dir, f_watershed)
+                    for _ in range(20):
+                        if os.path.exists(f_watershed_path) and os.path.getsize(f_watershed_path) > 0:
                             break
                         time.sleep(0.5)
 
-                    if not os.path.exists(f_watershed) or os.path.getsize(f_watershed) == 0:
-                        st.error("No se pudo generar la cuenca. Asegúrese en la Fase 2 que el punto de aforo esté colocado claramente sobre una zona de acumulación (valle o cauce visible).")
+                    if not os.path.exists(f_watershed_path) or os.path.getsize(f_watershed_path) == 0:
+                        st.error("WhiteboxTools no generó el ráster de cuenca. Verifique que el punto de aforo esté sobre una zona válida del DEM.")
                         st.stop()
 
-                    # Vectorización y cálculo final
-                    with rasterio.open(f_watershed) as src:
+                    # Vectorización y resultados
+                    with rasterio.open(f_watershed_path) as src:
                         watershed_data = src.read(1)
                         transform = src.transform
                         bounds = src.bounds
@@ -270,7 +272,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("El ráster de cuenca generado no contiene celdas válidas.")
+                        st.error("El ráster generado no contiene celdas válidas de cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else st.session_state.selected_epsg)
