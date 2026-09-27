@@ -155,167 +155,80 @@ elif opcion_menu == "2. Punto de Aforo":
 elif opcion_menu == "3. Modelamiento Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
-            with st.spinner("Procesando modelo espacial y cuenca vertiente..."):
+            with st.spinner("Procesando modelo hidrológico riguroso (Pysheds)..."):
                 try:
                     import geopandas as gpd
-                    import rasterio
-                    import time
-                    import numpy as np
-                    from rasterio.features import shapes
-                    from shapely.geometry import shape
-                    from rasterio.transform import rowcol, xy
+                    import os
+                    from pysheds.grid import Grid
                     import pyproj
 
                     base_dir = os.path.abspath(os.getcwd())
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
                     dem_input = st.session_state.dem_path
 
-                    # 1. Lectura del DEM y metadatos espaciales
-                    with rasterio.open(dem_input) as src:
-                        dem_data = src.read(1).astype(np.float32)
-                        transform = src.transform
-                        bounds = src.bounds
-                        raster_crs = src.crs
-                        nodata = src.nodata
-                        
-                        x_out = float(st.session_state.x_outlet)
-                        y_out = float(st.session_state.y_outlet)
+                    # 1. Cargar el DEM usando Pysheds
+                    grid = Grid.from_raster(dem_input, data_name='dem')
+                    dem = grid.read_raster(dem_input)
 
-                    # 2. Sincronización de coordenadas geográficas a UTM del DEM si es necesario
-                    if raster_crs:
-                        transformer_to_raster = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
+                    x_out = float(st.session_state.x_outlet)
+                    y_out = float(st.session_state.y_outlet)
+
+                    # 2. Sincronización de coordenadas (si el punto está en lat/lon y el DEM en UTM)
+                    if grid.crs:
+                        transformer = pyproj.Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
                         if abs(x_out) <= 180 and abs(y_out) <= 90:
-                            x_out, y_out = transformer_to_raster.transform(x_out, y_out)
+                            x_out, y_out = transformer.transform(x_out, y_out)
 
-                    if not (bounds.left <= x_out <= bounds.right and bounds.bottom <= y_out <= bounds.top):
-                        st.error(f"Error espacial: Las coordenadas del aforo ({x_out:.2f}, {y_out:.2f}) están fuera del DEM.")
+                    # 3. Preprocesamiento Hidrológico idéntico a ArcGIS
+                    # Rellenar depresiones (Fill sinks)
+                    pit_filled_dem = grid.fill_pits(dem)
+                    
+                    # Rellenar depresiones adicionales (Fill depressions)
+                    filled_dem = grid.fill_depressions(pit_filled_dem)
+                    
+                    # Resolver planicies (Resolve flats)
+                    inflated_dem = grid.resolve_flats(filled_dem)
+
+                    # 4. Direcciones de flujo D8 (Flow Direction)
+                    dirmap = {
+                        1: 64, 2: 128, 4: 1, 8: 2,
+                        16: 4, 32: 8, 64: 16, 128: 32
+                    }
+                    grid.flowdir(inflated_dem, dirmap=dirmap, out_name='dir')
+
+                    # 5. Acumulación de Flujo (Flow Accumulation)
+                    grid.accumulation(data='dir', out_name='acc')
+
+                    # 6. Snap to River (Ajustar punto de aforo al cauce con mayor acumulación cercana)
+                    x_snapped, y_snapped = grid.snap_to_mask(grid.acc > 50, (x_out, y_out))
+
+                    # 7. Delimitación de la Cuenca Vertiente (Catchment)
+                    grid.catchment(data='dir', x=x_snapped, y=y_snapped, out_name='catchment', recursionlimit=500000)
+
+                    # Recortar el ráster a la cuenca delimitada
+                    grid.clip_to('catchment')
+                    catchment_shape = grid.polygonize('catchment')
+
+                    # 8. Convertir a GeoDataFrame y guardar
+                    import json
+                    shapes_list = list(catchment_shape)
+                    if not shapes_list:
+                        st.error("No se pudo generar la geometría de la cuenca. Verifique las coordenadas del aforo.")
                         st.stop()
 
-                    if nodata is not None:
-                        dem_data[dem_data == nodata] = np.nan
+                    # Construir geometría GeoJSON
+                    geoms = [{"type": "Feature", "geometry": geom, "properties": {"id": 1}} for geom, val in shapes_list]
+                    geojson_dict = {"type": "FeatureCollection", "features": geoms}
 
-                    valid_min = np.nanmin(dem_data) if not np.all(np.isnan(dem_data)) else 0.0
-                    dem_data = np.nan_to_num(dem_data, nan=valid_min)
-                    rows, cols = dem_data.shape
-
-                    # 3. Cálculo de Direcciones de Flujo D8 con padding seguro
-                    directions = np.zeros((rows, cols), dtype=np.int32)
-                    neighbors = [
-                        (0, 1, 1), (1, 1, 2), (1, 0, 4), (1, -1, 8),
-                        (0, -1, 16), (-1, -1, 32), (-1, 0, 64), (-1, 1, 128)
-                    ]
-
-                    padded_dem = np.pad(dem_data, 1, mode='edge')
-                    max_slope = np.zeros((rows, cols), dtype=np.float32)
+                    gdf = gpd.GeoDataFrame.from_features(geojson_dict, crs=grid.crs if grid.crs else "EPSG:4326")
                     
-                    for dr, dc, code in neighbors:
-                        neighbor_elev = padded_dem[1+dr:1+dr+rows, 1+dc:1+dc+cols]
-                        dist = np.sqrt(dr**2 + dc**2)
-                        slope = (dem_data - neighbor_elev) / dist
-                        better = slope > max_slope
-                        max_slope[better] = slope[better]
-                        directions[better] = code
-
-                    # 4. Acumulación de Flujo Masiva para identificar el cauce principal
-                    flow_acc = np.ones((rows, cols), dtype=np.float32)
-                    flat_indices = np.argsort(dem_data.ravel())[::-1]
-                    d8_offsets = {
-                        1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
-                        16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)
-                    }
-
-                    for idx in flat_indices:
-                        r = idx // cols
-                        c = idx % cols
-                        code = directions[r, c]
-                        if code in d8_offsets:
-                            dr, dc = d8_offsets[code]
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < rows and 0 <= nc < cols:
-                                flow_acc[nr, nc] += flow_acc[r, c]
-
-                    # 5. Snap to River (Ajuste del punto de aforo al píxel de mayor acumulación cercano)
-                    row_orig, col_orig = rowcol(transform, x_out, y_out)
-                    search_rad = 120  # Radio amplio de búsqueda de cauce
-                    r_min = max(0, row_orig - search_rad)
-                    r_max = min(rows, row_orig + search_rad + 1)
-                    c_min = max(0, col_orig - search_rad)
-                    c_max = min(cols, col_orig + search_rad + 1)
-                    
-                    sub_acc = flow_acc[r_min:r_max, c_min:c_max]
-                    if sub_acc.size > 0:
-                        sub_idx = np.argmax(sub_acc)
-                        sub_r, sub_c = np.unravel_index(sub_idx, sub_acc.shape)
-                        best_row = r_min + sub_r
-                        best_col = c_min + sub_c
-                        x_snapped, y_snapped = xy(transform, best_row, best_col)
-                    else:
-                        best_row, best_col = row_orig, col_orig
-                        x_snapped, y_snapped = x_out, y_out
-
-                    # 6. Delimitación por Rastreo Inverso Exhaustivo (Cuenca Vertiente Completa Upstream)
-                    inv_direction_map = {
-                        (0, 1): 16,   
-                        (1, 1): 32,   
-                        (1, 0): 64,   
-                        (1, -1): 128, 
-                        (0, -1): 1,   
-                        (-1, -1): 2,  
-                        (-1, 0): 4,   
-                        (-1, 1): 8    
-                    }
-
-                    watershed_mask = np.zeros((rows, cols), dtype=np.uint8)
-                    stack = [(best_row, best_col)]
-                    watershed_mask[best_row, best_col] = 1
-
-                    # Recorrido iterativo completo para capturar toda la cuenca aguas arriba
-                    while stack:
-                        r, c = stack.pop()
-                        for (dr, dc), req_code in inv_direction_map.items():
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < rows and 0 <= nc < cols:
-                                if watershed_mask[nr, nc] == 0:
-                                    if directions[nr, nc] == req_code:
-                                        watershed_mask[nr, nc] = 1
-                                        stack.append((nr, nc))
-
-                    # Si el área delimitada es menor a 1000 píxeles, aplicamos expansión geomorfológica basada en umbral altitudinal e hidro-conectividad regional
-                    if np.sum(watershed_mask) < 1000:
-                        # Seleccionar toda la zona montañosa conectada aguas arriba por gradiente altitudinal acumulado
-                        base_elev = dem_data[best_row, best_col]
-                        # Máscara basada en relieve altitudinal ascendente desde la salida hasta las cumbres
-                        from scipy.ndimage import label, binary_dilation
-                        elev_mask = (dem_data >= base_elev - 50) & (dem_data <= base_elev + 4000)
-                        labeled, num = label(elev_mask)
-                        if num > 0:
-                            lbl = labeled[best_row, best_col]
-                            if lbl > 0:
-                                watershed_mask = (labeled == lbl).astype(np.uint8)
-                            else:
-                                # Fallback a un radio amplio de cuenca de montaña estándar
-                                yy, xx = np.ogrid[:rows, :cols]
-                                watershed_mask = ((yy - best_row)**2 + (xx - best_col)**2 <= 250**2).astype(np.uint8)
-                        else:
-                            yy, xx = np.ogrid[:rows, :cols]
-                            watershed_mask = ((yy - best_row)**2 + (xx - best_col)**2 <= 250**2).astype(np.uint8)
-
-                    # 7. Vectorización de la cuenca resultante
-                    shape_generator = shapes(watershed_mask, transform=transform)
-                    records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
-
-                    if not records:
-                        st.error("No se pudo generar la geometría vectorial de la cuenca.")
-                        st.stop()
-
-                    gdf = gpd.GeoDataFrame.from_features(records, crs=raster_crs if raster_crs else "EPSG:4326")
                     if len(gdf) > 1:
                         gdf = gpd.GeoDataFrame(geometry=[gdf.geometry.unary_union], crs=gdf.crs)
 
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # 8. Cálculo Morfométrico Exacto en coordenadas proyectadas (UTM)
+                    # 9. Cálculo Morfométrico Proyectado (Área, Perímetro, Gravelius)
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -332,10 +245,9 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     
                     area_km2 = area_m2 / 1_000_000
                     perimetro_km = perimetro_m / 1_000
-
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación hidrológica completa generada con éxito!")
+                    st.success("¡Delimitación hidrológica exacta completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
@@ -343,11 +255,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
-                    dem_clipped = dem_data.copy()
-                    dem_clipped[watershed_mask == 0] = np.nan
-
+                    # 10. Visualización gráfica
                     fig, ax = plt.subplots(figsize=(11, 7))
-                    im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
+                    dem_view = dem.copy()
+                    
+                    im = ax.imshow(dem_view, cmap='terrain', extent=grid.extent)
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#1d4ed8', linewidth=2.2, alpha=0.95)
                     ax.scatter([x_out], [y_out], color='red', marker='X', s=110, label='Aforo Original')
                     ax.scatter([x_snapped], [y_snapped], color='#eab308', marker='o', s=90, label='Punto de Cierre (Snap)')
@@ -357,7 +269,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     st.pyplot(fig)
 
                 except Exception as e:
-                    st.error(f"Error durante el procesamiento hidrológico: {e}")
+                    st.error(f"Error durante el procesamiento hidrológico riguroso: {e}")
     else:
         st.warning("Configure el DEM y el punto de aforo primero.")
 
