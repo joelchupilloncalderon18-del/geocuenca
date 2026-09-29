@@ -156,7 +156,7 @@ elif opcion_menu == "2. Punto de Aforo":
     else:
         st.warning("Cargue un archivo DEM para habilitar la visualizacion del punto de aforo.")
 
-elif opcion_menu == "3. Modelamiento Hidrologico":
+elif opcion_menu == "3. Modelado Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
         if st.button("Ejecutar Delimitacion Exacta", type="primary"):
             with st.spinner("Procesando modelo hidrológico profesional con WhiteboxTools..."):
@@ -170,21 +170,24 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     import os
 
                     base_dir = os.path.abspath(os.getcwd())
-                    dem_input = st.session_state.dem_path
+                    dem_input = os.path.abspath(st.session_state.dem_path)
                     
-                    # Rutas de salida temporales para WhiteboxTools
+                    # Rutas de salida absolutas y limpias para evitar errores de directorio
                     dem_breach = os.path.join(base_dir, "dem_breach.tif")
                     dem_flow_dir = os.path.join(base_dir, "dem_flow_dir.tif")
                     outlet_shp = os.path.join(base_dir, "outlet.shp")
                     watershed_raster = os.path.join(base_dir, "watershed.tif")
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
 
+                    # Limpiar archivos previos si existen
+                    for f_path in [dem_breach, dem_flow_dir, watershed_raster, output_geojson]:
+                        if os.path.exists(f_path):
+                            os.remove(f_path)
+
                     # 1. Lectura del DEM y coordenadas
                     with rasterio.open(dem_input) as src:
                         bounds = src.bounds
                         raster_crs = src.crs
-                        transform = src.transform
-                        nodata = src.nodata
                         x_out = float(st.session_state.x_outlet)
                         y_out = float(st.session_state.y_outlet)
 
@@ -194,7 +197,7 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
                             x_out, y_out = transformer.transform(x_out, y_out)
 
-                    # 2. Creación del archivo vectorial del punto de aforo (Shapefile requerido por WBT)
+                    # 2. Creación del archivo vectorial del punto de aforo
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[gpd.points_from_xy([x_out], [y_out])[0]],
                         crs=raster_crs if raster_crs else "EPSG:4326"
@@ -202,18 +205,18 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     outlet_gdf.to_file(outlet_shp)
 
                     # 3. Procesamiento Hidrológico Robusto con WhiteboxTools
-                    # Rellenar depresiones (Breach depressions)
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
-                    
-                    # Calcular dirección de flujo D8
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
-                    
-                    # Delimitación exacta de la cuenca hidrográfica aportante al punto
                     wbt.watershed(
                         d8_pntr=dem_flow_dir,
                         pour_pts=outlet_shp,
                         output=watershed_raster
                     )
+
+                    # Validación estricta de que WhiteboxTools generó el archivo raster de salida
+                    if not os.path.exists(watershed_raster):
+                        st.error("Error crítico: WhiteboxTools no generó el archivo raster de cuenca. Es probable que el punto de aforo esté fuera del área cubierta por el DEM o en una celda sin datos válidos (NoData).")
+                        st.stop()
 
                     # 4. Leer el raster resultante de la cuenca
                     with rasterio.open(watershed_raster) as w_src:
@@ -221,12 +224,11 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                         w_transform = w_src.transform
                         w_crs = w_src.crs
 
-                    # Verificar si se generó cuenca
                     if np.sum(watershed_mask > 0) == 0:
-                        st.error("El punto de aforo no intercepta ninguna red de drenaje válida. Ajuste las coordenadas o incremente el área de búsqueda.")
+                        st.error("El punto de aforo no intercepta ninguna red de drenaje válida. Ajuste las coordenadas dentro de la cuenca.")
                         st.stop()
 
-                    # Convertir máscara raster de cuenca a polígono vectorial (GeoJSON)
+                    # Convertir máscara raster a polígono vectorial (GeoJSON)
                     mask_bool = (watershed_mask > 0).astype(np.uint8)
                     shape_generator = shapes(mask_bool, transform=w_transform)
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
@@ -237,7 +239,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=w_crs if w_crs else "EPSG:4326")
                     
-                    # Unificar geometrías y extraer el polígono principal
                     if len(gdf) > 1:
                         unified_geom = gdf.geometry.unary_union
                         if unified_geom.geom_type == 'MultiPolygon':
@@ -248,7 +249,6 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
 
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     
-                    # Guardar variables en sesión para los pasos siguientes (Curva Hipsométrica)
                     st.session_state.cuenca_generada = True
                     st.session_state.basin_mask = (watershed_mask > 0)
                     st.session_state.transform = w_transform
@@ -279,15 +279,13 @@ elif opcion_menu == "3. Modelamiento Hidrologico":
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
                     m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
 
-                    # Recorte del DEM original para visualizar únicamente el interior de la cuenca
+                    # Recorte del DEM original para visualizar
                     with rasterio.open(dem_input) as src_dem:
                         dem_data = src_dem.read(1)
-                        dem_nodata = src_dem.nodates
 
                     dem_clipped = dem_data.copy()
                     dem_clipped[watershed_mask == 0] = np.nan
 
-                    # 6. Renderizado profesional de la cuenca delimitada
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#38bdf8', linewidth=2.0, alpha=0.9)
