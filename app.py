@@ -157,12 +157,15 @@ elif opcion_menu == "2. Punto de Aforo":
         st.warning("Cargue un archivo DEM para habilitar la visualizacion del punto de aforo.")
 
 elif opcion_menu == "3. Modelado Hidrologico":
-    st.markdown("### Modelado Hidrológico y Delimitación con Ajuste Automático al Cauce")
-    if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
-        st.info(f"Punto de aforo registrado: X = {st.session_state.x_outlet}, Y = {st.session_state.y_outlet}")
+    st.markdown("### 🌊 Modelado Hidrológico y Delimitación Exacta")
+    st.markdown("---")
+    
+    if st.session_state.get('dem_loaded', False) and 'x_outlet' in st.session_state:
+        st.success(f"**Punto de Aforo Registrado:** X = `{st.session_state.x_outlet}`, Y = `{st.session_state.y_outlet}`")
+        st.info("El sistema aplicará automáticamente el motor hidrológico con **Snap (Ajuste al Cauce Principal)** para garantizar una delimitación exacta idéntica a la de ArcGIS.")
         
-        if st.button("Ejecutar Delimitacion Exacta con Snap", type="primary"):
-            with st.spinner("Procesando modelado hidrológico y ajustando al cauce principal..."):
+        if st.button("🚀 Ejecutar Delimitacion Exacta con Snap", type="primary"):
+            with st.spinner("Procesando modelado hidrológico profesional (Breach, D8, Flow Accumulation, Snap y Watershed)..."):
                 try:
                     import geopandas as gpd
                     import rasterio
@@ -198,19 +201,19 @@ elif opcion_menu == "3. Modelado Hidrologico":
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
                             x_out, y_out = transformer.transform(x_out, y_out)
 
-                    # Crear vectorial del punto inicial
+                    # Crear archivo vectorial con el punto inicial ingresado
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[gpd.points_from_xy([x_out], [y_out])[0]],
                         crs=raster_crs if raster_crs else "EPSG:4326"
                     )
                     outlet_gdf.to_file(outlet_shp)
 
-                    # Procesamiento hidrológico base (Breach + Direccion de Flujo + Acumulacion)
+                    # Procesamiento hidrológico con WhiteboxTools
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
                     wbt.d8_flow_accumulation(dem=dem_breach, output=dem_acc)
 
-                    # Ajustar automáticamente el punto de aforo al cauce principal (Snap) dentro de un radio de 90 metros (3 celdas)
+                    # Ajuste automático del punto al cauce principal (Snap) en un radio de 90m
                     wbt.snap_pour_points(
                         pour_pts=outlet_shp,
                         flow_accum=dem_acc,
@@ -218,7 +221,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                         snap_dist=90.0
                     )
 
-                    # Delimitación de cuenca usando el punto ajustado al cauce
+                    # Delimitación final de la cuenca usando el punto ajustado
                     wbt.watershed(
                         d8_pntr=dem_flow_dir,
                         pour_pts=snapped_outlet_shp,
@@ -226,7 +229,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                     )
 
                     if not os.path.exists(watershed_raster):
-                        st.error("Error crítico: El motor hidrológico no generó la cuenca. Verifique que las coordenadas estén dentro del área del DEM.")
+                        st.error("Error crítico: El motor hidrológico no generó la cuenca. Verifique las coordenadas.")
                         st.stop()
 
                     with rasterio.open(watershed_raster) as w_src:
@@ -235,7 +238,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                         w_crs = w_src.crs
 
                     if np.sum(watershed_mask > 0) == 0:
-                        st.error("El punto ajustado no intercepta la red de drenaje. Intente reubicar ligeramente el punto de aforo.")
+                        st.error("El punto de aforo no intercepta ninguna red de drenaje válida. Reubique ligeramente el punto.")
                         st.stop()
 
                     mask_bool = (watershed_mask > 0).astype(np.uint8)
@@ -243,7 +246,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                     records = [{"geometry": shape(geom), "properties": {"id": 1}} for geom, val in shape_generator if val == 1]
 
                     if not records:
-                        st.error("No se pudo generar el polígono vectorial de la cuenca.")
+                        st.error("No se pudo generar la geometría vectorial de la cuenca.")
                         st.stop()
 
                     gdf = gpd.GeoDataFrame.from_features(records, crs=w_crs if w_crs else "EPSG:4326")
@@ -257,10 +260,9 @@ elif opcion_menu == "3. Modelado Hidrologico":
                             gdf = gpd.GeoDataFrame(geometry=[unified_geom], crs=gdf.crs)
 
                     gdf.to_file(output_geojson, driver="GeoJSON")
-                    
                     st.session_state.cuenca_generada = True
 
-                    # Cálculo morfométrico profesional
+                    # Cálculos morfométricos
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -295,7 +297,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#38bdf8', linewidth=2.0, alpha=0.9)
-                    ax.scatter([x_out], [y_out], color='red', marker='X', s=120, label='Punto Ingresado')
+                    ax.scatter([x_out], [y_out], color='red', marker='X', s=120, label='Punto de Aforo')
                     ax.set_title("Cuenca Delimitada con Ajuste Automático al Cauce Principal", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
@@ -304,7 +306,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                 except Exception as e:
                     st.error(f"Error durante el procesamiento hidrológico: {e}")
     else:
-        st.warning("Configure el DEM y el punto de aforo en los pasos anteriores.")
+        st.warning("⚠️ Debe cargar un archivo DEM y registrar el punto de aforo en los pasos anteriores antes de acceder al modelado hidrológico.")
 
 elif opcion_menu == "4. Parametros y Hipsometria":
     if 'cuenca_generada' in st.session_state and st.session_state.cuenca_generada:
