@@ -135,19 +135,26 @@ if opcion_menu == "1. Cargar DEM":
     else:
         st.info("Haga clic en '1. Cargar DEM' en el panel izquierdo para desplegar el selector de archivos.")
 
-# 2. SI SE SELECCIONA PUNTO DE AFORO, EMERGEN SUS CONTROLES EN LA BARRA LATERAL
-    if opcion_menu == "2. Punto de Aforo":
-        st.markdown("---")
-        st.markdown("#### Coordenadas Aforo")
-        if st.session_state.dem_loaded and os.path.exists(st.session_state.dem_path):
-            with rasterio.open(st.session_state.dem_path) as src:
-                bounds = src.bounds
-            x_outlet = st.number_input("Coordenada X (Este)", value=float((bounds.left + bounds.right) / 2), format="%.6f")
-            y_outlet = st.number_input("Coordenada Y (Norte)", value=float((bounds.bottom + bounds.top) / 2), format="%.6f")
-            st.session_state.x_outlet = x_outlet
-            st.session_state.y_outlet = y_outlet
-        else:
-            st.warning("Debe cargar un DEM primero.")
+elif opcion_menu == "2. Punto de Aforo":
+    if st.session_state.dem_loaded and os.path.exists(st.session_state.dem_path):
+        with rasterio.open(st.session_state.dem_path) as src:
+            bounds = src.bounds
+            dem_data = src.read(1)
+
+        fig, ax = plt.subplots(figsize=(11, 7))
+        ax.imshow(dem_data, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
+        
+        # Si ya se guardaron las coordenadas en la sesión, dibuja el marcador
+        if 'x_outlet' in st.session_state and 'y_outlet' in st.session_state:
+            ax.scatter([st.session_state.x_outlet], [st.session_state.y_outlet], color='red', marker='X', s=140, label='Punto de Aforo')
+            ax.legend(loc='upper right')
+            
+        ax.set_title("Verificacion de Ubicacion de Cierre sobre Relieve", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Coordenada X (Este)")
+        ax.set_ylabel("Coordenada Y (Norte)")
+        st.pyplot(fig)
+    else:
+        st.warning("Cargue un archivo DEM para habilitar la visualizacion del punto de aforo.")
 
 elif opcion_menu == "3. Modelamiento Hidrologico":
     if st.session_state.dem_loaded and 'x_outlet' in st.session_state:
