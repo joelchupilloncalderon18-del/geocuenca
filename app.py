@@ -156,20 +156,26 @@ elif opcion_menu == "2. Punto de Aforo":
     else:
         st.warning("Cargue un archivo DEM para habilitar la visualizacion del punto de aforo.")
 
-elif "Modelado" in opcion_menu:
-    st.markdown("### 🌊 Modelado Hidrológico y Delimitación Exacta")
+# --- BLOQUE DE MODELADO HIDROLÓGICO ASEGURADO ---
+if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_menu:
+    st.markdown("### 🌊 Módulo 3: Modelado Hidrológico y Delimitación")
     st.markdown("---")
     
-    # Verificamos de forma flexible si el DEM y las coordenadas existen
-    dem_ok = st.session_state.get('dem_loaded', False)
-    outlet_ok = 'x_outlet' in st.session_state and 'y_outlet' in st.session_state
-    
-    if dem_ok and outlet_ok:
-        st.success(f"**Punto de Aforo Registrado:** X = `{st.session_state.x_outlet}`, Y = `{st.session_state.y_outlet}`")
-        st.info("El sistema aplicará automáticamente el motor hidrológico con **Snap (Ajuste al Cauce Principal)** para garantizar una delimitación exacta idéntica a la de ArcGIS.")
+    # 1. Verificación segura del estado de la sesión
+    dem_cargado = st.session_state.get('dem_loaded', False)
+    punto_registrado = 'x_outlet' in st.session_state and 'y_outlet' in st.session_state
+
+    if not dem_cargado:
+        st.warning("⚠️ **Atención:** No se ha detectado ningún DEM cargado. Por favor, vaya al **Paso 1: Cargar DEM** para subir su archivo ráster.")
+    elif not punto_registrado:
+        st.warning("⚠️ **Atención:** No se ha registrado un punto de aforo. Por favor, vaya al **Paso 2: Punto de Aforo** para configurar las coordenadas.")
+    else:
+        # Todo está listo, mostramos la interfaz operativa
+        st.success(f"✅ **Configuración Valida:** Coordenadas de aforo X = `{st.session_state.x_outlet}`, Y = `{st.session_state.y_outlet}`")
+        st.info("El motor ejecutará el preprocesamiento, acumulación de flujo y **Snap (Ajuste Automático al Cauce)** para una delimitación idéntica a la de ArcGIS.")
         
-        if st.button("🚀 Ejecutar Delimitacion Exacta con Snap", type="primary"):
-            with st.spinner("Procesando modelado hidrológico profesional (Breach, D8, Flow Accumulation, Snap y Watershed)..."):
+        if st.button("🚀 Ejecutar Delimitación Exacta con Snap", type="primary"):
+            with st.spinner("Procesando modelado hidrológico profesional con WhiteboxTools..."):
                 try:
                     import geopandas as gpd
                     import rasterio
@@ -190,6 +196,7 @@ elif "Modelado" in opcion_menu:
                     watershed_raster = os.path.join(base_dir, "watershed.tif")
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
 
+                    # Limpieza de archivos temporales previos
                     for f_path in [dem_breach, dem_flow_dir, dem_acc, outlet_shp, snapped_outlet_shp, watershed_raster, output_geojson]:
                         if os.path.exists(f_path):
                             os.remove(f_path)
@@ -205,16 +212,19 @@ elif "Modelado" in opcion_menu:
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
                             x_out, y_out = transformer.transform(x_out, y_out)
 
+                    # Generación de geometría del punto inicial
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[gpd.points_from_xy([x_out], [y_out])[0]],
                         crs=raster_crs if raster_crs else "EPSG:4326"
                     )
                     outlet_gdf.to_file(outlet_shp)
 
+                    # Ejecución del pipeline de WhiteboxTools
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
                     wbt.d8_flow_accumulation(dem=dem_breach, output=dem_acc)
 
+                    # Ajuste automático al cauce (Snap) dentro de 90 metros
                     wbt.snap_pour_points(
                         pour_pts=outlet_shp,
                         flow_accum=dem_acc,
@@ -222,6 +232,7 @@ elif "Modelado" in opcion_menu:
                         snap_dist=90.0
                     )
 
+                    # Delimitación de cuenca hidrográfica
                     wbt.watershed(
                         d8_pntr=dem_flow_dir,
                         pour_pts=snapped_outlet_shp,
@@ -229,7 +240,7 @@ elif "Modelado" in opcion_menu:
                     )
 
                     if not os.path.exists(watershed_raster):
-                        st.error("Error crítico: El motor hidrológico no generó la cuenca. Verifique las coordenadas.")
+                        st.error("Error crítico: El motor WhiteboxTools no generó la máscara de cuenca.")
                         st.stop()
 
                     with rasterio.open(watershed_raster) as w_src:
@@ -238,7 +249,7 @@ elif "Modelado" in opcion_menu:
                         w_crs = w_src.crs
 
                     if np.sum(watershed_mask > 0) == 0:
-                        st.error("El punto de aforo no intercepta ninguna red de drenaje válida. Reubique ligeramente el punto.")
+                        st.error("El punto de aforo no intercepta ninguna red de drenaje válida. Reubique el punto.")
                         st.stop()
 
                     mask_bool = (watershed_mask > 0).astype(np.uint8)
@@ -262,6 +273,7 @@ elif "Modelado" in opcion_menu:
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
+                    # Métricas morfométricas
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -279,13 +291,13 @@ elif "Modelado" in opcion_menu:
                     perimetro_km = perimetro_m / 1_000
                     kc = 0.28 * perimetro_km / (area_km2 ** 0.5) if area_km2 > 0 else 1.0
 
-                    st.success("¡Delimitación y ajuste al cauce completados con éxito!")
+                    st.success("¡Delimitación completada con éxito!")
 
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Área de Cuenca", f"{area_km2:.2f} km2")
+                    m1.metric("Área", f"{area_km2:.2f} km²")
                     m2.metric("Perímetro", f"{perimetro_km:.2f} km")
                     m3.metric("Gravelius (Kc)", f"{kc:.2f}")
-                    m4.metric("Clase de Forma", "Alargada" if kc > 1.25 else "Compacta")
+                    m4.metric("Forma", "Alargada" if kc > 1.25 else "Compacta")
 
                     with rasterio.open(dem_input) as src_dem:
                         dem_data = src_dem.read(1)
@@ -296,16 +308,14 @@ elif "Modelado" in opcion_menu:
                     fig, ax = plt.subplots(figsize=(11, 7))
                     im = ax.imshow(dem_clipped, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
                     gdf.plot(ax=ax, facecolor='none', edgecolor='#38bdf8', linewidth=2.0, alpha=0.9)
-                    ax.scatter([x_out], [y_out], color='red', marker='X', s=120, label='Punto de Aforo')
-                    ax.set_title("Cuenca Delimitada con Ajuste Automático al Cauce Principal", fontsize=12, fontweight='bold')
+                    ax.scatter([x_out], [y_out], color='red', marker='X', s=120, label='Punto Ajustado')
+                    ax.set_title("Cuenca Delimitada (Motor Hidrológico Profesional)", fontsize=12, fontweight='bold')
                     ax.legend(loc='upper right', fontsize=9)
                     fig.colorbar(im, label="Elevación (msnm)")
                     st.pyplot(fig)
 
                 except Exception as e:
-                    st.error(f"Error durante el procesamiento hidrológico: {e}")
-    else:
-        st.warning("⚠️ Debe cargar un archivo DEM en el Paso 1 y registrar el punto de aforo en el Paso 2 antes de acceder al modelado hidrológico.")
+                    st.error(f"Error crítico en el motor de procesamiento: {e}")
 
 elif opcion_menu == "4. Parametros y Hipsometria":
     if 'cuenca_generada' in st.session_state and st.session_state.cuenca_generada:
