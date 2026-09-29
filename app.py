@@ -156,11 +156,15 @@ elif opcion_menu == "2. Punto de Aforo":
     else:
         st.warning("Cargue un archivo DEM para habilitar la visualizacion del punto de aforo.")
 
-elif opcion_menu == "3. Modelado Hidrologico":
+elif "Modelado" in opcion_menu:
     st.markdown("### 🌊 Modelado Hidrológico y Delimitación Exacta")
     st.markdown("---")
     
-    if st.session_state.get('dem_loaded', False) and 'x_outlet' in st.session_state:
+    # Verificamos de forma flexible si el DEM y las coordenadas existen
+    dem_ok = st.session_state.get('dem_loaded', False)
+    outlet_ok = 'x_outlet' in st.session_state and 'y_outlet' in st.session_state
+    
+    if dem_ok and outlet_ok:
         st.success(f"**Punto de Aforo Registrado:** X = `{st.session_state.x_outlet}`, Y = `{st.session_state.y_outlet}`")
         st.info("El sistema aplicará automáticamente el motor hidrológico con **Snap (Ajuste al Cauce Principal)** para garantizar una delimitación exacta idéntica a la de ArcGIS.")
         
@@ -201,19 +205,16 @@ elif opcion_menu == "3. Modelado Hidrologico":
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
                             x_out, y_out = transformer.transform(x_out, y_out)
 
-                    # Crear archivo vectorial con el punto inicial ingresado
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[gpd.points_from_xy([x_out], [y_out])[0]],
                         crs=raster_crs if raster_crs else "EPSG:4326"
                     )
                     outlet_gdf.to_file(outlet_shp)
 
-                    # Procesamiento hidrológico con WhiteboxTools
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
                     wbt.d8_flow_accumulation(dem=dem_breach, output=dem_acc)
 
-                    # Ajuste automático del punto al cauce principal (Snap) en un radio de 90m
                     wbt.snap_pour_points(
                         pour_pts=outlet_shp,
                         flow_accum=dem_acc,
@@ -221,7 +222,6 @@ elif opcion_menu == "3. Modelado Hidrologico":
                         snap_dist=90.0
                     )
 
-                    # Delimitación final de la cuenca usando el punto ajustado
                     wbt.watershed(
                         d8_pntr=dem_flow_dir,
                         pour_pts=snapped_outlet_shp,
@@ -262,7 +262,6 @@ elif opcion_menu == "3. Modelado Hidrologico":
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
 
-                    # Cálculos morfométricos
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -306,7 +305,7 @@ elif opcion_menu == "3. Modelado Hidrologico":
                 except Exception as e:
                     st.error(f"Error durante el procesamiento hidrológico: {e}")
     else:
-        st.warning("⚠️ Debe cargar un archivo DEM y registrar el punto de aforo en los pasos anteriores antes de acceder al modelado hidrológico.")
+        st.warning("⚠️ Debe cargar un archivo DEM en el Paso 1 y registrar el punto de aforo en el Paso 2 antes de acceder al modelado hidrológico.")
 
 elif opcion_menu == "4. Parametros y Hipsometria":
     if 'cuenca_generada' in st.session_state and st.session_state.cuenca_generada:
