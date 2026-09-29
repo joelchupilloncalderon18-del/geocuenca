@@ -120,7 +120,7 @@ with st.sidebar:
 # ==========================================
 
 if opcion_menu == "1. Cargar DEM":
-    if st.session_state.dem_loaded:
+    if st.session_state.dem_loaded and os.path.exists(st.session_state.dem_path):
         with rasterio.open(st.session_state.dem_path) as src:
             dem_data = src.read(1)
             bounds = src.bounds
