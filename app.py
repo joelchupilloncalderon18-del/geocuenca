@@ -222,7 +222,9 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
                     # Ejecución del pipeline de WhiteboxTools
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
-                    wbt.d8_flow_accumulation(dem=dem_breach, output=dem_acc)
+                    
+                    # Corrección: utilizar 'input=' en lugar de 'dem=' para la acumulación de flujo
+                    wbt.d8_flow_accumulation(input=dem_breach, output=dem_acc)
 
                     # Ajuste automático al cauce (Snap) dentro de 90 metros
                     wbt.snap_pour_points(
