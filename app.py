@@ -8,11 +8,12 @@ from shapely.geometry import shape
 import matplotlib.pyplot as plt
 import whitebox
 import os
+import tempfile
 
 # Configuracion de la interfaz SIG profesional - GeoCuenca
 st.set_page_config(
     page_title="GeoCuenca v1.0",
-    page_icon="??",
+    page_icon="💧",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -51,6 +52,23 @@ if 'dem_path' not in st.session_state:
     base_dir = "/tmp" if os.path.exists("/tmp") else os.getcwd()
     st.session_state.dem_path = os.path.join(base_dir, "work_dem_input.tif")
 
+# Función con caché para lectura instantánea y ultrarrápida del DEM
+@st.cache_data(show_spinner=False)
+def cargar_dem_optimizado(file_bytes):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    with rasterio.open(tmp_path) as src:
+        bounds = src.bounds
+        crs = src.crs
+        res = src.res
+        shape = src.shape
+        data = src.read(1)
+        nodata = src.nodata
+
+    return tmp_path, bounds, crs, res, shape, data, nodata
+
 # ==========================================
 # PANEL LATERAL IZQUIERDO (MODULO 1)
 # ==========================================
@@ -71,15 +89,16 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # 1. SI SE SELECCIONA CARGAR DEM, EMERGE EL SELECTOR EN LA BARRA LATERAL
+    # 1. SI SE SELECCIONA CARGAR DEM, EMERGE EL SELECTOR EN LA BARRA LATERAL (OPTIMIZADO)
     if opcion_menu == "1. Cargar DEM":
         st.markdown("#### Seleccionar DEM")
         uploaded_file = st.file_uploader("Archivo GeoTIFF (.tif)", type=["tif"], label_visibility="collapsed")
         if uploaded_file is not None:
-            with open(st.session_state.dem_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            st.session_state.dem_loaded = True
-            st.success("DEM cargado correctamente.")
+            with st.spinner("⚡ Procesando y cargando DEM a alta velocidad..."):
+                path_tmp, bounds, crs, res, shape, data, nodata = cargar_dem_optimizado(uploaded_file.getvalue())
+                st.session_state.dem_path = path_tmp
+                st.session_state.dem_loaded = True
+            st.success("¡DEM cargado correctamente con caché!")
         st.markdown("---")
 
     # Configuracion CRS
@@ -125,13 +144,13 @@ if opcion_menu == "1. Cargar DEM":
             dem_data = src.read(1)
             bounds = src.bounds
             
-            fig, ax = plt.subplots(figsize=(11, 7))
-            im = ax.imshow(dem_data, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
-            ax.set_title("Visualizacion del Relieve del Terreno (DEM)", fontsize=12, fontweight='bold')
-            ax.set_xlabel("Coordenada X (Este)")
-            ax.set_ylabel("Coordenada Y (Norte)")
-            fig.colorbar(im, label="Elevacion (msnm)")
-            st.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(11, 7))
+        im = ax.imshow(dem_data, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
+        ax.set_title("Visualizacion del Relieve del Terreno (DEM)", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Coordenada X (Este)")
+        ax.set_ylabel("Coordenada Y (Norte)")
+        fig.colorbar(im, label="Elevacion (msnm)")
+        st.pyplot(fig)
     else:
         st.info("Haga clic en '1. Cargar DEM' en el panel izquierdo para desplegar el selector de archivos.")
 
@@ -144,7 +163,6 @@ elif opcion_menu == "2. Punto de Aforo":
         fig, ax = plt.subplots(figsize=(11, 7))
         ax.imshow(dem_data, cmap='terrain', extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
         
-        # Si ya se guardaron las coordenadas en la sesión, dibuja el marcador
         if 'x_outlet' in st.session_state and 'y_outlet' in st.session_state:
             ax.scatter([st.session_state.x_outlet], [st.session_state.y_outlet], color='red', marker='X', s=140, label='Punto de Aforo')
             ax.legend(loc='upper right')
@@ -161,7 +179,6 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
     st.markdown("### 🌊 Módulo 3: Modelado Hidrológico y Delimitación")
     st.markdown("---")
     
-    # 1. Verificación segura del estado de la sesión
     dem_cargado = st.session_state.get('dem_loaded', False)
     punto_registrado = 'x_outlet' in st.session_state and 'y_outlet' in st.session_state
 
@@ -170,20 +187,13 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
     elif not punto_registrado:
         st.warning("⚠️ **Atención:** No se ha registrado un punto de aforo. Por favor, vaya al **Paso 2: Punto de Aforo** para configurar las coordenadas.")
     else:
-        # Todo está listo, mostramos la interfaz operativa
         st.success(f"✅ **Configuración Valida:** Coordenadas de aforo X = `{st.session_state.x_outlet}`, Y = `{st.session_state.y_outlet}`")
         st.info("El motor ejecutará el preprocesamiento, acumulación de flujo y **Snap (Ajuste Automático al Cauce)** para una delimitación idéntica a la de ArcGIS.")
         
         if st.button("🚀 Ejecutar Delimitación Exacta con Snap", type="primary"):
             with st.spinner("Procesando modelado hidrológico profesional con WhiteboxTools..."):
                 try:
-                    import geopandas as gpd
-                    import rasterio
-                    import numpy as np
-                    from rasterio.features import shapes
-                    from shapely.geometry import shape
                     import pyproj
-                    import os
 
                     base_dir = os.path.abspath(os.getcwd())
                     dem_input = os.path.abspath(st.session_state.dem_path)
@@ -196,7 +206,6 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
                     watershed_raster = os.path.join(base_dir, "watershed.tif")
                     output_geojson = os.path.join(base_dir, "cuenca_delimitada.geojson")
 
-                    # Limpieza de archivos temporales previos
                     for f_path in [dem_breach, dem_flow_dir, dem_acc, outlet_shp, snapped_outlet_shp, watershed_raster, output_geojson]:
                         if os.path.exists(f_path):
                             os.remove(f_path)
@@ -212,21 +221,17 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
                             transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
                             x_out, y_out = transformer.transform(x_out, y_out)
 
-                    # Generación de geometría del punto inicial
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[gpd.points_from_xy([x_out], [y_out])[0]],
                         crs=raster_crs if raster_crs else "EPSG:4326"
                     )
                     outlet_gdf.to_file(outlet_shp)
 
-                    # Ejecución del pipeline de WhiteboxTools
+                    # Ejecución del pipeline de WhiteboxTools (usando argumento posicional para evitar errores de versión)
                     wbt.breach_depressions(dem=dem_input, output=dem_breach)
                     wbt.d8_pointer(dem=dem_breach, output=dem_flow_dir)
-                    
-                    # Corrección: utilizar 'input=' en lugar de 'dem=' para la acumulación de flujo
-                    wbt.d8_flow_accumulation(input=dem_breach, output=dem_acc)
+                    wbt.d8_flow_accumulation(dem_breach, output=dem_acc)
 
-                    # Ajuste automático al cauce (Snap) dentro de 90 metros
                     wbt.snap_pour_points(
                         pour_pts=outlet_shp,
                         flow_accum=dem_acc,
@@ -234,7 +239,6 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
                         snap_dist=90.0
                     )
 
-                    # Delimitación de cuenca hidrográfica
                     wbt.watershed(
                         d8_pntr=dem_flow_dir,
                         pour_pts=snapped_outlet_shp,
@@ -274,8 +278,9 @@ if "Modelado" in opcion_menu or "Hidrológico" in opcion_menu or "3." in opcion_
 
                     gdf.to_file(output_geojson, driver="GeoJSON")
                     st.session_state.cuenca_generada = True
+                    st.session_state.basin_mask = (watershed_mask > 0)
+                    st.session_state.transform = w_transform
 
-                    # Métricas morfométricas
                     centroid_lat = gdf.geometry.centroid.y.iloc[0]
                     centroid_lon = gdf.geometry.centroid.x.iloc[0]
                     
@@ -337,12 +342,10 @@ elif opcion_menu == "4. Parametros y Hipsometria":
             elev_min = float(np.min(elevations))
             elev_media = float(np.mean(elevations))
             
-            # Curva Hipsometrica
             hist, bin_edges = np.histogram(elevations, bins=50)
             cumulative_area = np.cumsum(hist[::-1])[::-1]
             total_pixels = len(elevations)
             
-            # Celda area en km2
             transform = st.session_state.transform
             pixel_width = abs(transform[0])
             pixel_height = abs(transform[4])
